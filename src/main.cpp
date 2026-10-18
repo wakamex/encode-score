@@ -536,7 +536,8 @@ int main(int argc, char **argv) try {
             to_vmaf(c, p.y16.ptr, &dist);
             CUdeviceptr ring_slot = ring.ptr + (size_t)slot * plane * 4, mid_d = c.mid[cslot]->ptr;
             void *a[] = {&src.y16.ptr, &p.y16.ptr, &up10, &pw, &ph, &ring_slot, &mid_d, &c.stats->ptr};
-            cu_check(cuLaunchKernel(k.window_stats, ww, wh, 1, 256, 1, 1, 0, stream, a, nullptr), "window stats");
+            // one warp per strip of two windows and kernels.cu's WINDOW_ROWS rows of windows, 4 warps per block
+            cu_check(cuLaunchKernel(k.window_stats, (ww + 7) / 8, (wh + 1) / 2, 1, 32, 4, 1, 0, stream, a, nullptr), "window stats");
             cu_check(cuMemsetD32Async(c.sse->ptr, 0, 6, stream), "clearing");
             cu_check(cuMemsetD32Async(c.color->ptr, 0, 6, stream), "clearing");
             CUdeviceptr null = 0, sse = c.sse->ptr, s1 = sse + 8, s2 = sse + 16;

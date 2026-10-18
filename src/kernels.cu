@@ -331,71 +331,99 @@ __device__ __forceinline__ void block_sums(float *v, float (*part)[8])
 #define WIN 16
 #define WINDOW_STATS 8
 
+#define WINDOW_ROWS 2
+
 // Per 16 by 16 window of one frame pair: fine and mid detail energy of the source and the encode, the energy each shares
 // with the other, and the oriented detail of each (the difference of the eigenvalues of the summed structure tensor of
 // the 3-pixel-smoothed picture). Fine detail is luma less its 3 by 3 box mean, mid detail the 3 by 3 mean less the 9 by 9
 // mean, with the picture's edge pixels repeated beyond it; luma is on a 10-bit scale (the planes shifted up by `up`).
-// Also writes the mid detail planes for the texture measure. One block of 256 threads per window; out[window *
-// WINDOW_STATS + i] is: 0 source fine, 1 source mid, 2 encode fine, 3 encode mid, 4 shared fine, 5 shared mid, 6 source
-// oriented, 7 encode oriented.
+// Also writes the mid detail planes for the texture measure. out[window * WINDOW_STATS + i] is: 0 source fine, 1 source
+// mid, 2 encode fine, 3 encode mid, 4 shared fine, 5 shared mid, 6 source oriented, 7 encode oriented.
+//
+// Each warp moves down WINDOW_ROWS rows of windows in a strip of 32 columns, two windows wide, keeping the sums of 3 and
+// 9 pixels of the last rows in registers; the sums are exact, being of integers. A window's sums add each pair of rows
+// within its 16 lanes, then the pairs in order, as a block of 256 threads per window would. Blocks are 32 x 4 threads.
 extern "C" __global__ void window_stats(const uint16_t *yr, const uint16_t *yd, int up, int w, int h, float *mid_r,
                                         float *mid_d, float *out)
 {
-    // per picture: luma of the window and 4 pixels around it, its horizontal sums of 3 (for the columns from one before
-    // the window to one after) and of 9, and the 3 by 3 means from one pixel before the window to one after
-    // (rows of Y and B3 are 48 apart, so the two rows a warp reads are on different banks)
-    constexpr int R = 4, T = WIN + 2 * R, S = 48;
-    __shared__ float Y[2][T][S], H3[2][T][WIN + 2], H9[2][T][WIN], B3[2][WIN + 2][S];
-    __shared__ float part[12][8];
-    const int x0 = blockIdx.x * WIN, y0 = blockIdx.y * WIN, t = threadIdx.x;
-    for (int k = t; k < 2 * T * T; k += 256) {
-        const int pic = k / (T * T), r = k / T % T, c = k % T;
-        const int yy = min(max(y0 + r - R, 0), h - 1), xx = min(max(x0 + c - R, 0), w - 1);
-        Y[pic][r][c] = (float)((pic ? yd : yr)[(size_t)yy * w + xx] << up);
-    }
-    __syncthreads();
-    for (int k = t; k < 2 * T * (WIN + 2); k += 256) {
-        const int pic = k / (T * (WIN + 2)), r = k / (WIN + 2) % T, j = k % (WIN + 2);
-        H3[pic][r][j] = Y[pic][r][j + R - 2] + Y[pic][r][j + R - 1] + Y[pic][r][j + R];
-    }
-    // four sums of 9 per thread, each the one before plus the pixel entering and less the one leaving (exact, as the
-    // values are integers)
-    for (int k = t; k < 2 * T * WIN / 4; k += 256) {
-        const int pic = k / (T * WIN / 4), r = k / (WIN / 4) % T, j = k % (WIN / 4) * 4;
-        float s9 = 0;
-        for (int d = 0; d < 9; d++) s9 += Y[pic][r][j + d];
-        H9[pic][r][j] = s9;
-        for (int q = 1; q < 4; q++) H9[pic][r][j + q] = s9 += Y[pic][r][j + q + 8] - Y[pic][r][j + q - 1];
-    }
-    __syncthreads();
-    for (int k = t; k < 2 * (WIN + 2) * (WIN + 2); k += 256) {
-        const int pic = k / ((WIN + 2) * (WIN + 2)), i = k / (WIN + 2) % (WIN + 2), j = k % (WIN + 2);
-        B3[pic][i][j] = (H3[pic][i + R - 2][j] + H3[pic][i + R - 1][j] + H3[pic][i + R][j]) / 9.0f;
-    }
-    __syncthreads();
-    const int tx = t & 15, ty = t >> 4, x = x0 + tx, y = y0 + ty;
-    const size_t i = (size_t)y * w + x;
-    float fine[2], mid[2], gx[2] = {0, 0}, gy[2] = {0, 0};
-    for (int pic = 0; pic < 2; pic++) {
-        float s9 = 0;
-        for (int d = 0; d < 9; d++) s9 += H9[pic][ty + d][tx];
-        const float b3 = B3[pic][ty + 1][tx + 1], b9 = s9 / 81.0f;
-        fine[pic] = Y[pic][ty + R][tx + R] - b3;
-        mid[pic] = b3 - b9;
-        if (x > 0 && x < w - 1) gx[pic] = B3[pic][ty + 1][tx + 2] - B3[pic][ty + 1][tx];
-        if (y > 0 && y < h - 1) gy[pic] = B3[pic][ty + 2][tx + 1] - B3[pic][ty][tx + 1];
-    }
-    mid_r[i] = mid[0];
-    mid_d[i] = mid[1];
-    float v[12] = {fine[0] * fine[0], mid[0] * mid[0], fine[1] * fine[1], mid[1] * mid[1], fine[0] * fine[1], mid[0] * mid[1],
-                   gx[0] * gx[0], gy[0] * gy[0], gx[0] * gy[0], gx[1] * gx[1], gy[1] * gy[1], gx[1] * gy[1]};
-    block_sums<12>(v, part);
-    if (t == 0) {
-        float *o = out + ((size_t)blockIdx.y * gridDim.x + blockIdx.x) * WINDOW_STATS;
-        auto sum = [&](int k) { return part[k][0]; };
-        for (int k = 0; k < 6; k++) o[k] = sum(k);
-        o[6] = sqrtf((sum(6) - sum(7)) * (sum(6) - sum(7)) + 4 * sum(8) * sum(8));
-        o[7] = sqrtf((sum(9) - sum(10)) * (sum(9) - sum(10)) + 4 * sum(11) * sum(11));
+    constexpr int R = 4;
+    __shared__ float row[4][2][32 + 2 * R];  // per warp and picture, the strip's current row and 4 pixels either side
+    const int lane = threadIdx.x, warp = threadIdx.y, ww = w / WIN, wh = h / WIN;
+    const int x0 = (blockIdx.x * blockDim.y + warp) * 32, wy0 = blockIdx.y * WINDOW_ROWS;
+    if (x0 >= ww * WIN || wy0 >= wh) return;
+    const int x = x0 + lane, y0 = wy0 * WIN, y1 = min(wy0 + WINDOW_ROWS, wh) * WIN;
+    const bool inside = x < ww * WIN;
+    // per picture: sums of 3 around x - 1, x and x + 1 of the last 3 rows, 3 by 3 means at x of the 5 rows before
+    // this one and at x - 1 and x + 1 of the 4 rows before, sums of 9 around x of the last 9 rows, and luma of the last 5
+    float h3l[2][3] = {}, h3c[2][3] = {}, h3r[2][3] = {}, b3l[2][4] = {}, b3c[2][5] = {}, b3r[2][4] = {}, h9[2][9] = {}, yv[2][5] = {};
+    float even[12], sum[12] = {};
+    for (int r = y0 - R; r < y1 + R; r++) {
+        const int yy = min(max(r, 0), h - 1);
+        __syncwarp();
+#pragma unroll
+        for (int p = 0; p < 2; p++) {
+            const uint16_t *src = (p ? yd : yr) + (size_t)yy * w;
+            row[warp][p][lane] = (float)(src[min(max(x0 - R + lane, 0), w - 1)] << up);
+            if (lane < 2 * R) row[warp][p][32 + lane] = (float)(src[min(max(x0 + 32 - R + lane, 0), w - 1)] << up);
+        }
+        __syncwarp();
+#pragma unroll
+        for (int p = 0; p < 2; p++) {
+            float v[9];
+            for (int d = 0; d < 9; d++) v[d] = row[warp][p][lane + d];  // columns x - 4 to x + 4
+            float s9 = 0;
+            for (int d = 0; d < 9; d++) s9 += v[d];
+            for (int k = 0; k < 2; k++) { h3l[p][k] = h3l[p][k + 1]; h3c[p][k] = h3c[p][k + 1]; h3r[p][k] = h3r[p][k + 1]; }
+            h3l[p][2] = v[2] + v[3] + v[4];
+            h3c[p][2] = v[3] + v[4] + v[5];
+            h3r[p][2] = v[4] + v[5] + v[6];
+            // the 3 by 3 means of the row before this one
+            for (int k = 0; k < 4; k++) b3c[p][k] = b3c[p][k + 1];
+            for (int k = 0; k < 3; k++) { b3l[p][k] = b3l[p][k + 1]; b3r[p][k] = b3r[p][k + 1]; }
+            b3c[p][4] = (h3c[p][0] + h3c[p][1] + h3c[p][2]) / 9.0f;
+            b3l[p][3] = (h3l[p][0] + h3l[p][1] + h3l[p][2]) / 9.0f;
+            b3r[p][3] = (h3r[p][0] + h3r[p][1] + h3r[p][2]) / 9.0f;
+            for (int k = 0; k < 8; k++) h9[p][k] = h9[p][k + 1];
+            h9[p][8] = s9;
+            for (int k = 0; k < 4; k++) yv[p][k] = yv[p][k + 1];
+            yv[p][4] = v[4];
+        }
+        const int y = r - R;  // the row whose figures are now complete
+        if (y < y0) continue;
+        float fine[2], mid[2], gx[2] = {0, 0}, gy[2] = {0, 0};
+#pragma unroll
+        for (int p = 0; p < 2; p++) {
+            float s9 = 0;
+            for (int k = 0; k < 9; k++) s9 += h9[p][k];
+            const float b3 = b3c[p][1], b9 = s9 / 81.0f;
+            fine[p] = yv[p][0] - b3;
+            mid[p] = b3 - b9;
+            if (x > 0 && x < w - 1) gx[p] = b3r[p][0] - b3l[p][0];
+            if (y > 0 && y < h - 1) gy[p] = b3c[p][2] - b3c[p][0];
+        }
+        if (inside) {
+            mid_r[(size_t)y * w + x] = mid[0];
+            mid_d[(size_t)y * w + x] = mid[1];
+        }
+        const float v[12] = {fine[0] * fine[0], mid[0] * mid[0], fine[1] * fine[1], mid[1] * mid[1], fine[0] * fine[1], mid[0] * mid[1],
+                             gx[0] * gx[0], gy[0] * gy[0], gx[0] * gy[0], gx[1] * gx[1], gy[1] * gy[1], gx[1] * gy[1]};
+        const int ty = y % WIN;
+        if (!(ty & 1)) {
+            for (int k = 0; k < 12; k++) even[k] = v[k];
+            continue;
+        }
+#pragma unroll
+        for (int k = 0; k < 12; k++) {
+            float pair = even[k] + v[k];
+            for (int o = 8; o; o >>= 1) pair += __shfl_down_sync(0xffffffff, pair, o);
+            sum[k] = ty == 1 ? 0 + pair : sum[k] + pair;
+        }
+        if (ty == WIN - 1 && (lane & 15) == 0 && inside) {
+            float *o = out + ((size_t)(y / WIN) * ww + x / WIN) * WINDOW_STATS;
+            for (int k = 0; k < 6; k++) o[k] = sum[k];
+            o[6] = sqrtf((sum[6] - sum[7]) * (sum[6] - sum[7]) + 4 * sum[8] * sum[8]);
+            o[7] = sqrtf((sum[9] - sum[10]) * (sum[9] - sum[10]) + 4 * sum[11] * sum[11]);
+        }
     }
 }
 
