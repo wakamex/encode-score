@@ -4,34 +4,39 @@
 // ---- CAMBI (Contrast Aware Multiscale Banding Index), a port of libvmaf's cambi.c that gives the same scores ----
 #include "cambi_lut.h"
 
-// 1 where a pixel equals its right and bottom neighbours (the last column and row count as equal), as cambi.c's
-// get_derivative_data_for_row.
-extern "C" __global__ void cambi_derivative(const uint16_t *img, int pitch, int w, int h, uint8_t *d)
-{
-    int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= w || y >= h) return;
-    const uint16_t *row = img + (size_t)y * pitch;
-    bool hz = x == w - 1 || row[x] == row[x + 1];
-    bool vt = y == h - 1 || row[x] == row[x + pitch];
-    d[(size_t)y * w + x] = hz && vt;
-}
+#define MASK_ROWS 32
 
-// The spatial mask: 1 where more than `index` pixels of the 7x7 square around a pixel (zero outside the picture) have
-// zero derivative.
-extern "C" __global__ void cambi_mask(const uint8_t *d, int w, int h, int index, uint8_t *mask)
+// The spatial mask: 1 where more than `index` pixels of the 7x7 square around a pixel (none outside the picture) are
+// flat, that is equal their right and bottom neighbours (the last column and row count as equal), as cambi.c's
+// get_derivative_data_for_row. Each warp moves down MASK_ROWS rows of a strip of 32 columns: per row, its lanes find
+// which of the 64 pixels from 16 left of the strip are flat, count the 7 around each column, and keep the sum of the
+// counts of the last 7 rows. Blocks are 32 x 4 threads, one strip per warp.
+extern "C" __global__ void cambi_mask(const uint16_t *img, int w, int h, int index, uint8_t *mask)
 {
-    int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= w || y >= h) return;
-    int sum = 0;
-    for (int dy = -3; dy <= 3; dy++) {
-        int yy = y + dy;
-        if (yy < 0 || yy >= h) continue;
-        for (int dx = -3; dx <= 3; dx++) {
-            int xx = x + dx;
-            if (xx >= 0 && xx < w) sum += d[(size_t)yy * w + xx];
-        }
+    constexpr int R = 3;
+    const int lane = threadIdx.x, x0 = (blockIdx.x * blockDim.y + threadIdx.y) * 32, y0 = blockIdx.y * MASK_ROWS;
+    if (x0 >= w) return;
+    const int xa = x0 - 16 + lane, xb = x0 + 16 + lane;  // the two pixels of the row this lane looks at
+    auto at = [&](int x, int y) { return x >= 0 && x < w && y >= 0 && y < h ? (int)img[(size_t)y * w + x] : -1; };
+    int a = at(xa, y0 - R), b = at(xb, y0 - R);
+    int sum = 0, last[2 * R + 1] = {};  // the counts of the last 7 rows, oldest first
+    for (int y = y0 - R; y < y0 + MASK_ROWS + R; y++) {
+        const int na = at(xa, y + 1), nb = at(xb, y + 1);
+        int ra = __shfl_down_sync(0xffffffff, a, 1);
+        const int rb = __shfl_down_sync(0xffffffff, b, 1), b0 = __shfl_sync(0xffffffff, b, 0);
+        if (lane == 31) ra = b0;
+        const bool fa = a >= 0 && (xa == w - 1 || a == ra) && (y == h - 1 || a == na);
+        const bool fb = b >= 0 && (xb == w - 1 || b == rb) && (y == h - 1 || b == nb);
+        const unsigned long long flat = __ballot_sync(0xffffffff, fa) | (unsigned long long)__ballot_sync(0xffffffff, fb) << 32;
+        const int count = __popcll(flat >> (16 + lane - R) & 0x7f);
+        sum += count - last[0];
+#pragma unroll
+        for (int k = 0; k < 2 * R; k++) last[k] = last[k + 1];
+        last[2 * R] = count;
+        const int out = y - R;
+        if (out >= y0 && out < h && x0 + lane < w) mask[(size_t)out * w + x0 + lane] = sum > index;
+        a = na; b = nb;
     }
-    mask[(size_t)y * w + x] = sum > index;
 }
 
 // Every second pixel of every second row: dst (w, h) from src with row pitch `spitch`.
@@ -100,6 +105,8 @@ struct CambiScales {
     float *out[CAMBI_SCALES];
     int w[CAMBI_SCALES], h[CAMBI_SCALES];
     int first[CAMBI_SCALES + 1];  // the first block of each scale
+    double *sum;                  // per scale, the sum and count of the positive c-values
+    unsigned long long *count;
 };
 
 // The value of a pixel less band_base, or CAMBI_NONE outside the picture, the mask or the band.
@@ -123,7 +130,8 @@ __device__ __forceinline__ int cv_cols_bytes(int pad) { return (CV_TX + 2 * pad 
 // works as 32 / B groups of B lanes, each group sliding along its own part of the row.
 template <int B>
 __device__ void cv_passes(const uint16_t *img, const uint8_t *mask, const CambiParams &p, float *out, uint8_t *cols,
-                          uint16_t *counts, const uint16_t *rank, int relevant, int x0, int y0, int rows)
+                          uint16_t *counts, const uint16_t *rank, int relevant, int x0, int y0, int rows, double &sum,
+                          unsigned &positive)
 {
     // groups of lanes, steps between flushes of the counts, pixels per group and row, and flushes per row
     constexpr int G = 32 / B, K = 32 / G, PART = CV_TX / G, F = CV_TX / 32;
@@ -194,6 +202,7 @@ __device__ void cv_passes(const uint16_t *img, const uint8_t *mask, const CambiP
                         }
                     }
                     out[(size_t)y * p.w + x0 + mine + f * K] = c;
+                    if (c > 0) { sum += c; positive++; }
                 }
                 __syncwarp();
             }
@@ -205,7 +214,7 @@ __device__ void cv_passes(const uint16_t *img, const uint8_t *mask, const CambiP
 }
 
 // The c-values of cambi.c's c_value_pixel for every scale, one warp per tile of CV_TX by CV_TY pixels, with `out`
-// cleared by the caller. The warp first numbers, in order, the values the tile's c-values can need: those of the masked
+// cleared by the caller, and the sum and count of the positive ones, which the caller clears too. The warp first numbers, in order, the values the tile's c-values can need: those of the masked
 // pixels in the tile and its window margins that lie within CAMBI_DIFFS of a value of the tile's own pixels, usually a
 // handful. It then counts window pixels by those numbers: for every column of the tile and its margins it keeps the
 // counts in the vertical window around the current row, updated by the rows that enter and leave as it moves down, and
@@ -259,9 +268,13 @@ extern "C" __global__ void cambi_cvalues(CambiScales sc, CambiParams p)
     __syncwarp();
     if (relevant == 0) return;
     float *out = sc.out[s];
-    if (relevant <= 8) cv_passes<8>(img, mask, p, out, cols, counts, rank, relevant, x0, y0, rows);
-    else if (relevant <= 16) cv_passes<16>(img, mask, p, out, cols, counts, rank, relevant, x0, y0, rows);
-    else cv_passes<32>(img, mask, p, out, cols, counts, rank, relevant, x0, y0, rows);
+    double sum = 0;
+    unsigned positive = 0;
+    if (relevant <= 8) cv_passes<8>(img, mask, p, out, cols, counts, rank, relevant, x0, y0, rows, sum, positive);
+    else if (relevant <= 16) cv_passes<16>(img, mask, p, out, cols, counts, rank, relevant, x0, y0, rows, sum, positive);
+    else cv_passes<32>(img, mask, p, out, cols, counts, rank, relevant, x0, y0, rows, sum, positive);
+    for (int o = 16; o; o >>= 1) { sum += __shfl_down_sync(0xffffffff, sum, o); positive += __shfl_down_sync(0xffffffff, positive, o); }
+    if (lane == 0 && positive) { atomicAdd(&sc.sum[s], sum); atomicAdd(&sc.count[s], (unsigned long long)positive); }
 }
 
 // ---- Detail, texture, grain, color and PSNR measures ----
@@ -279,15 +292,14 @@ __device__ __forceinline__ unsigned sample(const void *plane, int pitch, int x, 
     return (f.bytes == 1 ? ((const uint8_t *)row)[x] : ((const uint16_t *)row)[x]) >> f.shift;
 }
 
-// The frame cropped at (x0, y0) to w x h: luma as float on a 10-bit scale, and luma and both chroma planes as integers
-// at the pipeline's bit depth `pd` (8 or 10). An 8-bit frame in a 10-bit pipeline is shifted up by 2, as libvmaf does.
-extern "C" __global__ void frame_planes(Frame f, int x0, int y0, int pd, float *y_out, uint16_t *y16_out, uint16_t *u_out,
+// The frame cropped at (x0, y0) to w x h: luma and both chroma planes as integers at the pipeline's bit depth `pd` (8
+// or 10). An 8-bit frame in a 10-bit pipeline is shifted up by 2, as libvmaf does.
+extern "C" __global__ void frame_planes(Frame f, int x0, int y0, int pd, uint16_t *y16_out, uint16_t *u_out,
                                         uint16_t *v_out, int w, int h)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
     const unsigned l = sample(f.y, f.ypitch, x + x0, y + y0, f);
-    y_out[(size_t)y * w + x] = (float)(l << (10 - f.depth));
     y16_out[(size_t)y * w + x] = l << (pd - f.depth);
     if ((x & 1) || (y & 1)) return;
     const int cx = (x + x0) / 2, cy = (y + y0) / 2, ci = (y / 2) * (w / 2) + x / 2;
@@ -297,46 +309,23 @@ extern "C" __global__ void frame_planes(Frame f, int x0, int y0, int pd, float *
     v_out[ci] = v << (pd - f.depth);
 }
 
-extern "C" __global__ void box_h(const float *in, float *h3, float *h9, int w, int h)
+// The sums of N values over a block of 256 threads, into part[k][0]: each adds within warps, then the warps' sums in
+// order.
+template <int N>
+__device__ __forceinline__ void block_sums(float *v, float (*part)[8])
 {
-    int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= w || y >= h) return;
-    const float *row = in + (size_t)y * w;
-    float s3 = 0, s9 = 0;
-    for (int d = -4; d <= 4; d++) {
-        float v = row[min(max(x + d, 0), w - 1)];
-        s9 += v;
-        if (d >= -1 && d <= 1) s3 += v;
+    const int t = threadIdx.x;
+    for (int k = 0; k < N; k++) {
+        for (int o = 16; o; o >>= 1) v[k] += __shfl_down_sync(0xffffffff, v[k], o);
+        if ((t & 31) == 0) part[k][t >> 5] = v[k];
     }
-    h3[(size_t)y * w + x] = s3;
-    h9[(size_t)y * w + x] = s9;
-}
-
-// Vertical means of the horizontal sums: the 3 by 3 and 9 by 9 box means.
-extern "C" __global__ void box_v(const float *h3, const float *h9, float *b3, float *b9, int w, int h)
-{
-    int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= w || y >= h) return;
-    float s3 = 0, s9 = 0;
-    for (int d = -4; d <= 4; d++) {
-        size_t i = (size_t)min(max(y + d, 0), h - 1) * w + x;
-        s9 += h9[i];
-        if (d >= -1 && d <= 1) s3 += h3[i];
+    __syncthreads();
+    if (t < N) {
+        float s = 0;
+        for (int k = 0; k < 8; k++) s += part[t][k];
+        part[t][0] = s;
     }
-    b3[(size_t)y * w + x] = s3 / 9.0f;
-    b9[(size_t)y * w + x] = s9 / 81.0f;
-}
-
-__device__ __forceinline__ float block_sum(float v, float *scratch)
-{
-    for (int o = 16; o; o >>= 1) v += __shfl_down_sync(0xffffffff, v, o);
-    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     __syncthreads();
-    if (lane == 0) scratch[warp] = v;
-    __syncthreads();
-    float s = 0;
-    if (threadIdx.x == 0) for (int i = 0; i < (int)(blockDim.x >> 5); i++) s += scratch[i];
-    return s;  // valid in thread 0
 }
 
 #define WIN 16
@@ -344,32 +333,69 @@ __device__ __forceinline__ float block_sum(float v, float *scratch)
 
 // Per 16 by 16 window of one frame pair: fine and mid detail energy of the source and the encode, the energy each shares
 // with the other, and the oriented detail of each (the difference of the eigenvalues of the summed structure tensor of
-// the 3-pixel-smoothed picture). Also writes the mid detail planes for the texture measure. One block of 256 threads per
-// window; out[window * WINDOW_STATS + i] is: 0 source fine, 1 source mid, 2 encode fine, 3 encode mid, 4 shared fine,
-// 5 shared mid, 6 source oriented, 7 encode oriented.
-extern "C" __global__ void window_stats(const float *yr, const float *b3r, const float *b9r,
-                                        const float *yd, const float *b3d, const float *b9d,
-                                        int w, int h, float *mid_r, float *mid_d, float *out)
+// the 3-pixel-smoothed picture). Fine detail is luma less its 3 by 3 box mean, mid detail the 3 by 3 mean less the 9 by 9
+// mean, with the picture's edge pixels repeated beyond it; luma is on a 10-bit scale (the planes shifted up by `up`).
+// Also writes the mid detail planes for the texture measure. One block of 256 threads per window; out[window *
+// WINDOW_STATS + i] is: 0 source fine, 1 source mid, 2 encode fine, 3 encode mid, 4 shared fine, 5 shared mid, 6 source
+// oriented, 7 encode oriented.
+extern "C" __global__ void window_stats(const uint16_t *yr, const uint16_t *yd, int up, int w, int h, float *mid_r,
+                                        float *mid_d, float *out)
 {
-    __shared__ float scratch[8];
-    const int wx = blockIdx.x, wy = blockIdx.y;
-    const int x = wx * WIN + (threadIdx.x & 15), y = wy * WIN + (threadIdx.x >> 4);
+    // per picture: luma of the window and 4 pixels around it, its horizontal sums of 3 (for the columns from one before
+    // the window to one after) and of 9, and the 3 by 3 means from one pixel before the window to one after
+    // (rows of Y and B3 are 48 apart, so the two rows a warp reads are on different banks)
+    constexpr int R = 4, T = WIN + 2 * R, S = 48;
+    __shared__ float Y[2][T][S], H3[2][T][WIN + 2], H9[2][T][WIN], B3[2][WIN + 2][S];
+    __shared__ float part[12][8];
+    const int x0 = blockIdx.x * WIN, y0 = blockIdx.y * WIN, t = threadIdx.x;
+    for (int k = t; k < 2 * T * T; k += 256) {
+        const int pic = k / (T * T), r = k / T % T, c = k % T;
+        const int yy = min(max(y0 + r - R, 0), h - 1), xx = min(max(x0 + c - R, 0), w - 1);
+        Y[pic][r][c] = (float)((pic ? yd : yr)[(size_t)yy * w + xx] << up);
+    }
+    __syncthreads();
+    for (int k = t; k < 2 * T * (WIN + 2); k += 256) {
+        const int pic = k / (T * (WIN + 2)), r = k / (WIN + 2) % T, j = k % (WIN + 2);
+        H3[pic][r][j] = Y[pic][r][j + R - 2] + Y[pic][r][j + R - 1] + Y[pic][r][j + R];
+    }
+    // four sums of 9 per thread, each the one before plus the pixel entering and less the one leaving (exact, as the
+    // values are integers)
+    for (int k = t; k < 2 * T * WIN / 4; k += 256) {
+        const int pic = k / (T * WIN / 4), r = k / (WIN / 4) % T, j = k % (WIN / 4) * 4;
+        float s9 = 0;
+        for (int d = 0; d < 9; d++) s9 += Y[pic][r][j + d];
+        H9[pic][r][j] = s9;
+        for (int q = 1; q < 4; q++) H9[pic][r][j + q] = s9 += Y[pic][r][j + q + 8] - Y[pic][r][j + q - 1];
+    }
+    __syncthreads();
+    for (int k = t; k < 2 * (WIN + 2) * (WIN + 2); k += 256) {
+        const int pic = k / ((WIN + 2) * (WIN + 2)), i = k / (WIN + 2) % (WIN + 2), j = k % (WIN + 2);
+        B3[pic][i][j] = (H3[pic][i + R - 2][j] + H3[pic][i + R - 1][j] + H3[pic][i + R][j]) / 9.0f;
+    }
+    __syncthreads();
+    const int tx = t & 15, ty = t >> 4, x = x0 + tx, y = y0 + ty;
     const size_t i = (size_t)y * w + x;
-    const float fr = yr[i] - b3r[i], mr = b3r[i] - b9r[i], fd = yd[i] - b3d[i], md = b3d[i] - b9d[i];
-    mid_r[i] = mr;
-    mid_d[i] = md;
-    float gxr = 0, gyr = 0, gxd = 0, gyd = 0;
-    if (x > 0 && x < w - 1) { gxr = b3r[i + 1] - b3r[i - 1]; gxd = b3d[i + 1] - b3d[i - 1]; }
-    if (y > 0 && y < h - 1) { gyr = b3r[i + w] - b3r[i - w]; gyd = b3d[i + w] - b3d[i - w]; }
-    const float vals[12] = {fr * fr, mr * mr, fd * fd, md * md, fr * fd, mr * md,
-                            gxr * gxr, gyr * gyr, gxr * gyr, gxd * gxd, gyd * gyd, gxd * gyd};
-    float s[12];
-    for (int k = 0; k < 12; k++) s[k] = block_sum(vals[k], scratch);
-    if (threadIdx.x == 0) {
-        float *o = out + ((size_t)wy * gridDim.x + wx) * WINDOW_STATS;
-        for (int k = 0; k < 6; k++) o[k] = s[k];
-        o[6] = sqrtf((s[6] - s[7]) * (s[6] - s[7]) + 4 * s[8] * s[8]);
-        o[7] = sqrtf((s[9] - s[10]) * (s[9] - s[10]) + 4 * s[11] * s[11]);
+    float fine[2], mid[2], gx[2] = {0, 0}, gy[2] = {0, 0};
+    for (int pic = 0; pic < 2; pic++) {
+        float s9 = 0;
+        for (int d = 0; d < 9; d++) s9 += H9[pic][ty + d][tx];
+        const float b3 = B3[pic][ty + 1][tx + 1], b9 = s9 / 81.0f;
+        fine[pic] = Y[pic][ty + R][tx + R] - b3;
+        mid[pic] = b3 - b9;
+        if (x > 0 && x < w - 1) gx[pic] = B3[pic][ty + 1][tx + 2] - B3[pic][ty + 1][tx];
+        if (y > 0 && y < h - 1) gy[pic] = B3[pic][ty + 2][tx + 1] - B3[pic][ty][tx + 1];
+    }
+    mid_r[i] = mid[0];
+    mid_d[i] = mid[1];
+    float v[12] = {fine[0] * fine[0], mid[0] * mid[0], fine[1] * fine[1], mid[1] * mid[1], fine[0] * fine[1], mid[0] * mid[1],
+                   gx[0] * gx[0], gy[0] * gy[0], gx[0] * gy[0], gx[1] * gx[1], gy[1] * gy[1], gx[1] * gy[1]};
+    block_sums<12>(v, part);
+    if (t == 0) {
+        float *o = out + ((size_t)blockIdx.y * gridDim.x + blockIdx.x) * WINDOW_STATS;
+        auto sum = [&](int k) { return part[k][0]; };
+        for (int k = 0; k < 6; k++) o[k] = sum(k);
+        o[6] = sqrtf((sum(6) - sum(7)) * (sum(6) - sum(7)) + 4 * sum(8) * sum(8));
+        o[7] = sqrtf((sum(9) - sum(10)) * (sum(9) - sum(10)) + 4 * sum(11) * sum(11));
     }
 }
 
@@ -380,7 +406,7 @@ extern "C" __global__ void window_stats(const float *yr, const float *b3r, const
 // T = (A + B) / 2. out: 0 sum(source mid * T), 1 sum(encode mid * T), 2 sum(A * B), 3 sum(A * A), 4 sum(B * B).
 extern "C" __global__ void persist_stats(const float *ring, size_t plane, int centre, const float *mid_d, int w, float *out)
 {
-    __shared__ float scratch[8];
+    __shared__ float part[5][8];
     const int wx = blockIdx.x, wy = blockIdx.y;
     const int x = wx * WIN + (threadIdx.x & 15), y = wy * WIN + (threadIdx.x >> 4);
     const size_t i = (size_t)y * w + x;
@@ -388,12 +414,11 @@ extern "C" __global__ void persist_stats(const float *ring, size_t plane, int ce
     const float a = (at(-6) + at(-4) + at(-2) + at(2) + at(4) + at(6)) / 6.0f;
     const float b = (at(-5) + at(-3) + at(-1) + at(1) + at(3) + at(5)) / 6.0f;
     const float t = (a + b) / 2;
-    const float vals[5] = {at(0) * t, mid_d[i] * t, a * b, a * a, b * b};
-    float s[5];
-    for (int k = 0; k < 5; k++) s[k] = block_sum(vals[k], scratch);
+    float v[5] = {at(0) * t, mid_d[i] * t, a * b, a * a, b * b};
+    block_sums<5>(v, part);
     if (threadIdx.x == 0) {
         float *o = out + ((size_t)wy * gridDim.x + wx) * PERSIST_STATS;
-        for (int k = 0; k < 5; k++) o[k] = s[k];
+        for (int k = 0; k < 5; k++) o[k] = part[k][0];
     }
 }
 
@@ -412,17 +437,22 @@ extern "C" __global__ void plane_sse(const uint16_t *a, const uint16_t *b, const
 
 // Sums of the chroma values and of the color strength (distance from neutral 512) of a pair of chroma planes, on a
 // 10-bit scale (`up` is the shift from the planes' bit depth to 10).
+// The sums of values are exact integers; each thread adds its few strengths in single precision, which keeps the
+// arithmetic off the GPU's slow double-precision units.
 extern "C" __global__ void color_sums(const uint16_t *u, const uint16_t *v, size_t n, int up, double *sums)
 {
-    double su = 0, sv = 0, ss = 0;
+    unsigned long long su = 0, sv = 0;
+    float ss = 0;
     for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
-        const double uu = (double)(u[i] << up), vv = (double)(v[i] << up), du = uu - 512, dv = vv - 512;
-        su += uu; sv += vv; ss += sqrt(du * du + dv * dv);
+        const int uu = u[i] << up, vv = v[i] << up, du = uu - 512, dv = vv - 512;
+        su += uu; sv += vv; ss += sqrtf((float)(du * du + dv * dv));
     }
+    double strength = ss;
     for (int o = 16; o; o >>= 1) {
-        su += __shfl_down_sync(0xffffffff, su, o); sv += __shfl_down_sync(0xffffffff, sv, o); ss += __shfl_down_sync(0xffffffff, ss, o);
+        su += __shfl_down_sync(0xffffffff, su, o); sv += __shfl_down_sync(0xffffffff, sv, o);
+        strength += __shfl_down_sync(0xffffffff, strength, o);
     }
-    if ((threadIdx.x & 31) == 0) { atomicAdd(&sums[0], su); atomicAdd(&sums[1], sv); atomicAdd(&sums[2], ss); }
+    if ((threadIdx.x & 31) == 0) { atomicAdd(&sums[0], (double)su); atomicAdd(&sums[1], (double)sv); atomicAdd(&sums[2], strength); }
 }
 
 // cambi.c's filter_mode in one pass: the vertical mode of the horizontal modes of three neighbours (first and last

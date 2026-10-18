@@ -15,6 +15,7 @@ int get_vlt_luma(double threshold, VmafLumaRange range, VmafEOTF eotf);
 }
 
 static constexpr int kScaleWeights[5] = {16, 8, 4, 2, 1}, kTileW = 64, kTileH = 32;  // kernels.cu's CV_TX and CV_TY
+static constexpr int kMaskRows = 32;  // kernels.cu's MASK_ROWS
 static constexpr double kTopk = 0.6, kTvi = 0.019, kMax = 1000.0;
 
 static int ceil_log2(uint32_t n)
@@ -29,7 +30,7 @@ static size_t topk_count(size_t n) { return std::clamp((size_t)(int)(kTopk * (do
 
 Cambi::Cambi(const Kernels &k, int w, int h, int depth) : w_(w), h_(h), depth_(depth)
 {
-    derivative_ = k.get("cambi_derivative"); mask_kernel_ = k.get("cambi_mask");
+    mask_kernel_ = k.get("cambi_mask");
     from8_ = k.get("cambi_from8"); decimate16_ = k.get("cambi_decimate16"); decimate8_ = k.get("cambi_decimate8"); mode_ = k.get("cambi_mode");
     cvalues_ = k.get("cambi_cvalues");
     radix_ = k.get("radix_histogram"); sum_above_ = k.get("sum_above");
@@ -69,7 +70,6 @@ Cambi::Cambi(const Kernels &k, int w, int h, int depth) : w_(w), h_(h), depth_(d
     cvalues_at_[kScales] = total;
     const size_t n = (size_t)w * h;
     cu_check(cuMemAlloc(&scratch_, n * 2), "cambi buffers");
-    cu_check(cuMemAlloc(&deriv_, n), "cambi buffers");
     cu_check(cuMemAlloc(&cvalues_all_, total * 4), "cambi buffers");
     cu_check(cuMemAlloc(&hist_, 256 * 4), "cambi buffers");
     cu_check(cuMemAlloc(&sums_, sizeof(Sums)), "cambi buffers");
@@ -78,7 +78,7 @@ Cambi::Cambi(const Kernels &k, int w, int h, int depth) : w_(w), h_(h), depth_(d
 
 Cambi::~Cambi()
 {
-    for (CUdeviceptr p : {scratch_, deriv_, cvalues_all_, hist_, sums_}) if (p) cuMemFree(p);
+    for (CUdeviceptr p : {scratch_, cvalues_all_, hist_, sums_}) if (p) cuMemFree(p);
     for (int s = 0; s < kScales; s++) for (CUdeviceptr p : {image_[s], mask_[s]}) if (p) cuMemFree(p);
     if (host_) cuMemFreeHost(host_);
     if (copied_) cuEventDestroy(copied_);
@@ -102,8 +102,11 @@ void Cambi::launch(CUdeviceptr img, int pitch, CUstream stream)
     }
     cu_check(cuEventRecord(copied_, stream), "cambi copy");
     cu_check(cuStreamWaitEvent(stream_, copied_, 0), "cambi copy");
-    { void *a[] = {&scratch_, &w, &w, &h, &deriv_}; Kernels::launch(derivative_, w, h, a, stream_); }
-    { int idx = mask_index_; void *a[] = {&deriv_, &w, &h, &idx, &mask_[0]}; Kernels::launch(mask_kernel_, w, h, a, stream_); }
+    {
+        int idx = mask_index_;
+        void *a[] = {&scratch_, &w, &h, &idx, &mask_[0]};
+        cu_check(cuLaunchKernel(mask_kernel_, (w + 127) / 128, (h + kMaskRows - 1) / kMaskRows, 1, 32, 4, 1, 0, stream_, a, nullptr), "cambi mask");
+    }
     // each scale's picture is the mode filter of the one before it decimated, and its mask the mask before it decimated
     for (int s = 0; s < kScales; s++) {
         w = sw_[s]; h = sh_[s];
@@ -115,25 +118,19 @@ void Cambi::launch(CUdeviceptr img, int pitch, CUstream stream)
         void *a[] = {&scratch_, &w, &h, &image_[s]};
         Kernels::launch(mode_, w, h, a, stream_);
     }
-    // the c-values of all scales in one launch (kernels.cu's CambiScales)
-    struct { CUdeviceptr img[kScales], mask[kScales], out[kScales]; int w[kScales], h[kScales], first[kScales + 1]; } scales;
+    // the c-values of all scales in one launch (kernels.cu's CambiScales), with the sum and count of the positive ones,
+    // which give the pooled score whenever no more than 60% are positive
+    struct { CUdeviceptr img[kScales], mask[kScales], out[kScales]; int w[kScales], h[kScales], first[kScales + 1]; CUdeviceptr sum, count; } scales;
     for (int s = 0; s < kScales; s++) {
         scales.img[s] = image_[s]; scales.mask[s] = mask_[s]; scales.out[s] = cvalues_all_ + cvalues_at_[s] * 4;
         scales.w[s] = sw_[s]; scales.h[s] = sh_[s]; scales.first[s] = first_[s];
     }
     scales.first[kScales] = first_[kScales];
+    scales.sum = sums_; scales.count = sums_ + offsetof(Sums, count);
     cu_check(cuMemsetD32Async(cvalues_all_, 0, cvalues_at_[kScales], stream_), "clearing c-values");
+    cu_check(cuMemsetD8Async(sums_, 0, sizeof(Sums), stream_), "clearing sums");
     void *a[] = {&scales, &params_};
     cu_check(cuLaunchKernel(cvalues_, blocks_, 1, 1, 32, 1, 1, shared_, stream_, a, nullptr), "cambi c-values");
-    // the sum and count of the positive c-values, which give the pooled score whenever no more than 60% are positive
-    cu_check(cuMemsetD8Async(sums_, 0, sizeof(Sums), stream_), "clearing sums");
-    for (int s = 0; s < kScales; s++) {
-        size_t n = (size_t)sw_[s] * sh_[s];
-        float zero = 0.0f;
-        CUdeviceptr out = scales.out[s], sum = sums_ + s * 8, count = sums_ + offsetof(Sums, count) + s * 8;
-        void *b[] = {&out, &n, &zero, &sum, &count};
-        cu_check(cuLaunchKernel(sum_above_, 256, 1, 1, 256, 1, 1, 0, stream_, b, nullptr), "summing c-values");
-    }
     cu_check(cuMemcpyDtoHAsync(host_, sums_, sizeof(Sums), stream_), "reading sums");
 }
 

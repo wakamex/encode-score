@@ -87,10 +87,10 @@ struct Buffer {
     Buffer(const Buffer &) = delete;
 };
 
-// The pictures of one frame of one file: luma as float and as 10-bit integers, chroma, and the box-filtered luma.
+// The planes of one frame of one file at the pipeline's bit depth.
 struct Planes {
-    Buffer y, y16, u, v, b3, b9;
-    Planes(size_t n) : y(n * 4), y16(n * 2), u(n / 2), v(n / 2), b3(n * 4), b9(n * 4) {}
+    Buffer y16, u, v;
+    Planes(size_t n) : y16(n * 2), u(n / 2), v(n / 2) {}
 };
 
 // A decoded frame as the kernels read it (kernels.cu's Frame).
@@ -225,10 +225,9 @@ static std::vector<bool> place(const std::vector<double> &gpu_rate, const std::v
 }
 
 struct Kernel {
-    CUfunction frame_planes, to_picture, box_h, box_v, window_stats, persist_stats, plane_sse, color_sums;
+    CUfunction frame_planes, to_picture, window_stats, persist_stats, plane_sse, color_sums;
     explicit Kernel(const Kernels &k)
-        : frame_planes(k.get("frame_planes")), to_picture(k.get("to_picture")), box_h(k.get("box_h")), box_v(k.get("box_v")),
-          window_stats(k.get("window_stats")), persist_stats(k.get("persist_stats")), plane_sse(k.get("plane_sse")),
+        : frame_planes(k.get("frame_planes")), to_picture(k.get("to_picture")), window_stats(k.get("window_stats")), persist_stats(k.get("persist_stats")), plane_sse(k.get("plane_sse")),
           color_sums(k.get("color_sums")) {}
 };
 
@@ -443,7 +442,7 @@ int main(int argc, char **argv) try {
     CUevent copied;
     cu_check(cuEventCreate(&copied, CU_EVENT_DISABLE_TIMING), "creating an event");
     int up10 = 10 - pd;
-    Buffer h3(n * 4), h9(n * 4), src_color(3 * 8);
+    Buffer src_color(3 * 8);
     Buffer ring(n * 4 * kRing);  // the source's mid detail planes, by frame % kRing
     std::unique_ptr<Cambi> source_cambi[2];
     for (auto &c : source_cambi) c = std::make_unique<Cambi>(kernels, w, h, pd);
@@ -499,12 +498,8 @@ int main(int argc, char **argv) try {
             cu_check(cuStreamWaitEvent(stream, copied, 0), "event");
         }
         int xx = x0, yy = y0, pw = w, ph = h, depth = pd;
-        void *a[] = {&view, &xx, &yy, &depth, &p.y.ptr, &p.y16.ptr, &p.u.ptr, &p.v.ptr, &pw, &ph};
+        void *a[] = {&view, &xx, &yy, &depth, &p.y16.ptr, &p.u.ptr, &p.v.ptr, &pw, &ph};
         Kernels::launch(k.frame_planes, w, h, a, stream);
-        void *c[] = {&p.y.ptr, &h3.ptr, &h9.ptr, &pw, &ph};
-        Kernels::launch(k.box_h, w, h, c, stream);
-        void *d[] = {&h3.ptr, &h9.ptr, &p.b3.ptr, &p.b9.ptr, &pw, &ph};
-        Kernels::launch(k.box_v, w, h, d, stream);
     };
     auto to_vmaf = [&](Candidate &c, CUdeviceptr y16, VmafPicture *pic) {
         vmaf_check(vmaf_cuda_fetch_preallocated_picture(c.vmaf, pic), "fetching a picture");
@@ -540,7 +535,7 @@ int main(int argc, char **argv) try {
             to_vmaf(c, src.y16.ptr, &ref);
             to_vmaf(c, p.y16.ptr, &dist);
             CUdeviceptr ring_slot = ring.ptr + (size_t)slot * plane * 4, mid_d = c.mid[cslot]->ptr;
-            void *a[] = {&src.y.ptr, &src.b3.ptr, &src.b9.ptr, &p.y.ptr, &p.b3.ptr, &p.b9.ptr, &pw, &ph, &ring_slot, &mid_d, &c.stats->ptr};
+            void *a[] = {&src.y16.ptr, &p.y16.ptr, &up10, &pw, &ph, &ring_slot, &mid_d, &c.stats->ptr};
             cu_check(cuLaunchKernel(k.window_stats, ww, wh, 1, 256, 1, 1, 0, stream, a, nullptr), "window stats");
             cu_check(cuMemsetD32Async(c.sse->ptr, 0, 6, stream), "clearing");
             cu_check(cuMemsetD32Async(c.color->ptr, 0, 6, stream), "clearing");
