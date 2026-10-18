@@ -69,7 +69,7 @@ CAMBI is a port of libvmaf's `cambi.c`; it counts the same windows with a differ
 
 The program works on two frames at once: while the GPU computes the measures of one frame, the processor adds up the figures of the frame before. Decoding, the GPU's work and the processor's then overlap, and a run goes as fast as the slowest of them.
 
-Decoding is often the slowest. The GPU has one video decoder, which takes turns among all the files of a run, so for runs of 5 minutes or more the program measures how fast each file decodes on the GPU's decoder and on the processor, and gives files to the processor when that makes decoding faster. A 1080p [H.264](https://en.wikipedia.org/wiki/Advanced_Video_Coding) source, for example, decodes faster on a 16-core processor than on the GPU's decoder, which is then left to the encodes. If the run then turns out slower than decoding everything on the GPU's decoder would allow, because other programs come to load the processor or because the GPU's other work is the limit and the processor's decoding slows the program's feeding of it, those files go back to the GPU's decoder from their next frame, and the program says so.
+Decoding is often the slowest. The GPU's video decoder takes turns among all the files of a run, so for runs of 5 minutes or more the program measures how fast each file decodes on the GPU's decoder and on the processor, and gives files to the processor when that makes decoding faster. A 1080p [H.264](https://en.wikipedia.org/wiki/Advanced_Video_Coding) source, for example, decodes faster on a 16-core processor than on the GPU's decoder, which is then left to the encodes. If the run then turns out slower than decoding everything on the GPU's decoder would allow, because other programs come to load the processor or because the GPU's other work is the limit and the processor's decoding slows the program's feeding of it, those files go back to the GPU's decoder from their next frame, and the program says so.
 
 On an RTX 3090 with a 16-core Ryzen 9 3950X, with the source's CAMBI cached (computing it as well takes the first run to 615-616):
 
@@ -78,8 +78,10 @@ On an RTX 3090 with a 16-core Ryzen 9 3950X, with the source's CAMBI cached (com
 | 1080p H.264 source (a streaming service's episode) against an HEVC encode, 5 minutes | 673-675 |
 | 4K [High Efficiency Video Coding (HEVC)](https://en.wikipedia.org/wiki/High_Efficiency_Video_Coding) remux of Dune: Part Two against an AV1 encode, 1 minute | 173-175 |
 | The same remux against two AV1 encodes in one pass, 1 minute | 115-116 |
+| The whole 44-minute episode against its encode, the source's CAMBI computed too | 579 (112 s) |
+| 10 minutes of the film's remux against an AV1 encode of the whole film, the source's CAMBI computed too | 163 |
 
-Before scoring, finding the offset decodes 28 seconds of the source and 8 seconds of each encode, all side by side, which takes about 5 seconds at 4K with two encodes; `--offset SECONDS` skips it. Scenes with much banding are slower, because CAMBI counts every banded pixel's window, and other work on the GPU slows a run in proportion. A run against a source scored before skips the source's CAMBI for the frames already in the cache. The same measures as 6 second clips in the earlier Python version would have taken about 27 hours for one film.
+Before scoring, finding the offset decodes 28 seconds of the source and 8 seconds of each encode, all side by side, which takes about 5 seconds at 4K with two encodes (`--offset SECONDS` skips it), and measuring the decoding rates for a run of 5 minutes or more takes about 2 seconds at 4K. Scenes with much banding are slower, because CAMBI counts every banded pixel's window, and other work on the GPU slows a run in proportion. A run against a source scored before skips the source's CAMBI for the frames already in the cache. The same measures as 6 second clips in the earlier Python version would have taken about 27 hours for one film.
 
 ## Use case: choosing settings to re-encode a 4K film
 
