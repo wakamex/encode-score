@@ -639,24 +639,22 @@ int main(int argc, char **argv) try {
         }
     };
 
-    // A file decoding on the processor goes back to the GPU's decoder, from its next frame, when over 5 seconds the loop
-    // waits for it for more than a tenth of the time and runs slower than all files decoding on the GPU would, as when
-    // other programs come to load the processor.
-    auto now = [] { return std::chrono::steady_clock::now(); };
+    // Files decoding on the processor go back to the GPU's decoder, from their next frame, when over 5 seconds (after
+    // the first 5) the run is slower than decoding all files on the GPU's decoder would allow: other programs may have
+    // come to load the processor, or the GPU's other work may be the limit, which the processor's decoding then slows.
     auto since = [](std::chrono::steady_clock::time_point t) { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count(); };
-    std::vector<double> waited(files.size(), 0), last(files.size(), 0);  // seconds waited for each, and its last frame's time
-    auto window = now();
-    long window_frames = 0;
+    std::vector<double> last(files.size(), 0);  // the time of each file's last frame
+    auto window = std::chrono::steady_clock::now();
+    long window_frames = 0, windows_seen = 0;
     auto fall_back = [&] {
-        const double el = since(window);
-        for (size_t i = 0; i < files.size(); i++)
-            if (!on_gpu[i] && probes[i].gpu && waited[i] > 0.1 * el && window_frames / el * gpu_time < 1) {
-                decoders[i] = std::make_unique<Decoder>(files[i], device, last[i] + 1 / fps, true);
-                on_gpu[i] = true;
-                std::fprintf(stderr, "%s fell behind on the processor and decodes on the GPU's decoder from %.3f s\n", files[i].c_str(), last[i] + 1 / fps);
-            }
-        std::fill(waited.begin(), waited.end(), 0);
-        window = now();
+        if (windows_seen++ && window_frames / since(window) * gpu_time < 1)
+            for (size_t i = 0; i < files.size(); i++)
+                if (!on_gpu[i] && probes[i].gpu) {
+                    decoders[i] = std::make_unique<Decoder>(files[i], device, last[i] + 1 / fps, true);
+                    on_gpu[i] = true;
+                    std::fprintf(stderr, "%s decodes on the GPU's decoder from %.3f s, as the run fell below its speed\n", files[i].c_str(), last[i] + 1 / fps);
+                }
+        window = std::chrono::steady_clock::now();
         window_frames = 0;
     };
 
@@ -666,9 +664,7 @@ int main(int argc, char **argv) try {
         std::vector<AVFrame *> got;
         bool ended = false;
         for (size_t i = 0; i < files.size(); i++) {
-            const auto t = now();
             got.push_back(decoders[i]->next());
-            waited[i] += since(t);
             if (got.back()) last[i] = decoders[i]->seconds(got.back());
             ended |= !got.back();
         }
