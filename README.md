@@ -6,7 +6,7 @@ VMAF alone is a poor judge of small encodes of grainy or dark material. It score
 
 ## Requirements and building
 
-encode-score runs on an NVIDIA GPU (Turing or newer) and Linux. It decodes with the GPU's video decoder where it can and on the processor otherwise, computes VMAF with libvmaf's CUDA backend, and runs its own measures as CUDA kernels.
+encode-score runs on an NVIDIA GPU (Turing or newer) and Linux. It decodes each file with the GPU's video decoder or on the processor, whichever makes the run faster (see Speed), computes VMAF with libvmaf's CUDA backend, and runs its own measures as CUDA kernels.
 
 Building needs:
 
@@ -67,7 +67,19 @@ CAMBI is a port of libvmaf's `cambi.c`; it counts the same windows with a differ
 
 ## Speed
 
-On an RTX 3090 with the GPU otherwise idle, scoring a 4K HDR film against its Blu-ray remux runs at about 125 frames per second for one encode, so a 2 hour 46 minute film takes about half an hour, and two encodes in one pass run at about 55 frames per second. Scenes with much banding are slower, because CAMBI counts every banded pixel's window, and other work on the GPU slows it in proportion. A run against a source scored before skips the source's CAMBI for the frames already in the cache. The same measures as 6 second clips in the earlier Python version would have taken about 27 hours for one film.
+The program works on two frames at once: while the GPU computes the measures of one frame, the processor adds up the figures of the frame before. Decoding, the GPU's work and the processor's then overlap, and a run goes as fast as the slowest of them.
+
+Decoding is often the slowest. The GPU has one video decoder, which takes turns among all the files of a run, so for runs of 5 minutes or more the program measures how fast each file decodes on the GPU's decoder and on the processor, and gives files to the processor when that makes decoding faster. A 1080p [H.264](https://en.wikipedia.org/wiki/Advanced_Video_Coding) source, for example, decodes faster on a 16-core processor than on the GPU's decoder, which is then left to the encodes. If other programs later load the processor so much that the run falls behind, the file goes back to the GPU's decoder from its next frame, and the program says so.
+
+On an RTX 3090 with a 16-core Ryzen 9 3950X, with the source's CAMBI cached:
+
+| Run | Frames per second |
+|---|---:|
+| 1080p H.264 source (a streaming service's episode) against an HEVC encode, 5 minutes | 506-518 |
+| 4K [High Efficiency Video Coding (HEVC)](https://en.wikipedia.org/wiki/High_Efficiency_Video_Coding) remux of Dune: Part Two against an AV1 encode, 1 minute | 167-168 |
+| The same remux against two AV1 encodes in one pass, 1 minute | 107-108 |
+
+Before scoring, finding the offset decodes 28 seconds of the source and 8 seconds of each encode, all side by side, which takes about 5 seconds at 4K with two encodes; `--offset SECONDS` skips it. Scenes with much banding are slower, because CAMBI counts every banded pixel's window, and other work on the GPU slows a run in proportion. A run against a source scored before skips the source's CAMBI for the frames already in the cache. The same measures as 6 second clips in the earlier Python version would have taken about 27 hours for one film.
 
 ## Use case: choosing settings to re-encode a 4K film
 
@@ -100,7 +112,7 @@ The recipe used 2.4 Mbps in that clip against the benchmark's 3.1 Mbps. On the 8
 
 ## Use case: choosing encoder settings for a Twitch stream
 
-A live stream is a fixed-bitrate problem. [Twitch](https://www.twitch.tv/) takes [H.264](https://en.wikipedia.org/wiki/Advanced_Video_Coding) at a capped bitrate with a keyframe every 2 seconds (check the current limits in Twitch's [broadcasting guidelines](https://help.twitch.tv/s/article/broadcasting-guidelines)), and the encoder must keep up in real time beside the game. So the bitrate is set, and the question is which encoder, preset, resolution and frame rate look best at it. encode-score answers that from a recording of your own game, since what compresses badly differs from game to game.
+A live stream is a fixed-bitrate problem. [Twitch](https://www.twitch.tv/) takes H.264 at a capped bitrate with a keyframe every 2 seconds (check the current limits in Twitch's [broadcasting guidelines](https://help.twitch.tv/s/article/broadcasting-guidelines)), and the encoder must keep up in real time beside the game. So the bitrate is set, and the question is which encoder, preset, resolution and frame rate look best at it. encode-score answers that from a recording of your own game, since what compresses badly differs from game to game.
 
 1. Record a master. In [OBS Studio](https://obsproject.com/), set the recording to the stream's resolution and frame rate with recording quality "Lossless", and record a few minutes that include the hard parts of your game: fast camera turns, foliage or particles, dark scenes with gradients, and a static menu.
 
@@ -132,7 +144,6 @@ Two parts of the score mean something slightly different for game footage. The g
 - The score has not been fitted to viewer ratings. It ranks encodes by measured faults, and the weights decide how those faults trade against each other.
 - VMAF is trained on standard dynamic range pictures. For HDR it is a relative measure of drift from the source, not an absolute rating.
 - Lasting texture needs 13 neighbouring frames with little motion; a segment with fewer than 100 qualifying windows is scored without the texture part, and the worst tenth of windows is noisy in very dark scenes.
-- libvmaf's CUDA path gives NaN scores for some frames when its work overlaps other GPU work in the same context, so the program waits for the GPU before and after each libvmaf step. That costs some overlap but keeps every frame's score correct.
 - Encodes scored in one pass must start at the same point of the source; score encodes cut from different points in separate runs.
 
 ## Development
@@ -142,8 +153,6 @@ uv run python -m unittest discover -s tests
 ```
 
 The tests generate their own video with FFmpeg. They check the program frame by frame against FFmpeg's libvmaf filter for VMAF, CAMBI and PSNR at 8 and 10 bits; check the detail, texture, grain and color figures against the numpy implementation in `reference/`; check that the offset of an encode starting a second later is found to the frame and that a different picture is refused; and check that a source decoded on the processor scores exactly as when decoded on the GPU, and that two encodes in one pass score as they do alone. They keep their CAMBI cache in a temporary folder and check that a second run reads the source's CAMBI from it unchanged. The tests of the program are skipped without an NVIDIA GPU and the built program (`build/encode-score`, or the path in `ENCODE_SCORE_BIN`).
-
-Setting `ESCORE_PROFILE=1` prints the wall time of each stage of the per-frame loop, waiting for the GPU at each stage so the time lands on the right one.
 
 `reference/encode_score` is the numpy implementation of the measures, kept as the specification the GPU kernels are tested against; its own tests are the `test_reference_*` files.
 

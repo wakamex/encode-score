@@ -34,6 +34,7 @@ Cambi::Cambi(const Kernels &k, int w, int h, int depth) : w_(w), h_(h), depth_(d
     cvalues_ = k.get("cambi_cvalues");
     radix_ = k.get("radix_histogram"); sum_above_ = k.get("sum_above");
     cu_check(cuStreamCreate(&stream_, CU_STREAM_NON_BLOCKING), "creating a stream");
+    cu_check(cuEventCreate(&copied_, CU_EVENT_DISABLE_TIMING), "creating an event");
     window_ = ((65 * (w + h) / 375) >> 4) | 1;  // cambi.c's adjust_window_size
     mask_index_ = (49 + 3 * (ceil_log2((uint32_t)((w >> 6) * (h >> 6))) - 11) - 1) >> 1;
     VmafLumaRange range;
@@ -80,25 +81,27 @@ Cambi::~Cambi()
     for (CUdeviceptr p : {scratch_, deriv_, cvalues_all_, hist_, sums_}) if (p) cuMemFree(p);
     for (int s = 0; s < kScales; s++) for (CUdeviceptr p : {image_[s], mask_[s]}) if (p) cuMemFree(p);
     if (host_) cuMemFreeHost(host_);
+    if (copied_) cuEventDestroy(copied_);
     if (stream_) cuStreamDestroy(stream_);
 }
 
-void Cambi::launch(CUdeviceptr img, int pitch, CUevent ready)
+void Cambi::launch(CUdeviceptr img, int pitch, CUstream stream)
 {
-    cu_check(cuStreamWaitEvent(stream_, ready, 0), "waiting for the picture");
     int w = w_, h = h_;
     // scale 0 works on a copy in scratch_; an 8-bit picture is brought to 10 bits and through the anti-dithering filter
     // on the way, as cambi.c's preprocessing does
     if (depth_ == 8) {
         void *a[] = {&img, &pitch, &w, &h, &scratch_};
-        Kernels::launch(from8_, w, h, a, stream_);
+        Kernels::launch(from8_, w, h, a, stream);
     } else {
         CUDA_MEMCPY2D m = {};
         m.srcMemoryType = m.dstMemoryType = CU_MEMORYTYPE_DEVICE;
         m.srcDevice = img; m.srcPitch = (size_t)pitch * 2; m.dstDevice = scratch_; m.dstPitch = (size_t)w * 2;
         m.WidthInBytes = (size_t)w * 2; m.Height = h;
-        cu_check(cuMemcpy2DAsync(&m, stream_), "cambi copy");
+        cu_check(cuMemcpy2DAsync(&m, stream), "cambi copy");
     }
+    cu_check(cuEventRecord(copied_, stream), "cambi copy");
+    cu_check(cuStreamWaitEvent(stream_, copied_, 0), "cambi copy");
     { void *a[] = {&scratch_, &w, &w, &h, &deriv_}; Kernels::launch(derivative_, w, h, a, stream_); }
     { int idx = mask_index_; void *a[] = {&deriv_, &w, &h, &idx, &mask_[0]}; Kernels::launch(mask_kernel_, w, h, a, stream_); }
     // each scale's picture is the mode filter of the one before it decimated, and its mask the mask before it decimated

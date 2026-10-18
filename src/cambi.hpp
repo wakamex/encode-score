@@ -1,6 +1,7 @@
 // CAMBI banding score of a 10-bit luma plane on the GPU, matching libvmaf's cambi feature with its default options.
 // launch() queues the whole computation on the instance's own stream and finish() returns the score, so several
-// instances (the source and each encode) run side by side.
+// instances (the source and each encode, and consecutive frames) run side by side. Each launch() is followed by its
+// finish() before the instance's next launch().
 #pragma once
 #include "gpu.hpp"
 #include <cstdint>
@@ -11,8 +12,10 @@ public:
     Cambi(const Kernels &k, int w, int h, int depth);
     ~Cambi();
     Cambi(const Cambi &) = delete;
-    // Starts scoring the plane at `img` (10-bit values, `pitch` in pixels) once `ready` has fired.
-    void launch(CUdeviceptr img, int pitch, CUevent ready);
+    // Starts scoring the plane at `img` (10-bit values, `pitch` in pixels). The plane is copied on `stream`, after the
+    // work already queued there, and the rest runs on the instance's own stream, so the plane can be overwritten by
+    // work queued on `stream` afterwards.
+    void launch(CUdeviceptr img, int pitch, CUstream stream);
     // The score, clamped to 1000 as libvmaf does.
     double finish();
 
@@ -21,6 +24,7 @@ private:
     double topk_exact(int scale);
     CUfunction from8_, derivative_, mask_kernel_, decimate16_, decimate8_, mode_, cvalues_, radix_, sum_above_;
     CUstream stream_ = nullptr;
+    CUevent copied_ = nullptr;
     int w_, h_, depth_, window_, mask_index_, blocks_ = 0;
     unsigned shared_;
     int sw_[kScales], sh_[kScales], first_[kScales + 1];
