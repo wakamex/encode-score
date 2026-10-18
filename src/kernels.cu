@@ -54,8 +54,6 @@ __device__ __forceinline__ uint16_t mode3(uint16_t a, uint16_t b, uint16_t c)
     return min(a, min(b, c));
 }
 
-#define CAMBI_TX 32
-#define CAMBI_TY 8
 #define CAMBI_DIFFS 4
 #define CAMBI_NONE 0xFFFF
 
@@ -91,181 +89,179 @@ extern "C" __global__ void sum_above(const float *v, size_t n, float threshold, 
     if ((threadIdx.x & 31) == 0) { atomicAdd(sum, s); atomicAdd(count, c); }
 }
 
+#define CAMBI_SCALES 5
+#define CV_TX 64
+#define CV_TY 32
 
-// The c-values of cambi.c's c_value_pixel, counting the whole window for every pixel but with the nine counts packed into
-// two 64-bit registers (12 bits each, enough for a window of up to 4095 pixels) so the loop stays out of local memory.
-extern "C" __global__ void cambi_cvalues_packed(const uint16_t *img, const uint8_t *mask, CambiParams p, float *out)
+// The pictures of all scales, whose c-values one launch of cambi_cvalues computes.
+struct CambiScales {
+    const uint16_t *img[CAMBI_SCALES];
+    const uint8_t *mask[CAMBI_SCALES];
+    float *out[CAMBI_SCALES];
+    int w[CAMBI_SCALES], h[CAMBI_SCALES];
+    int first[CAMBI_SCALES + 1];  // the first block of each scale
+};
+
+// The value of a pixel less band_base, or CAMBI_NONE outside the picture, the mask or the band.
+__device__ __forceinline__ int cv_value(const uint16_t *img, const uint8_t *mask, const CambiParams &p, int x, int y)
 {
-    extern __shared__ uint16_t tile[];
-    const int tw = CAMBI_TX + 2 * p.pad, th = CAMBI_TY + 2 * p.pad;
-    const int x0 = blockIdx.x * CAMBI_TX - p.pad, y0 = blockIdx.y * CAMBI_TY - p.pad;
-    for (int i = threadIdx.y * CAMBI_TX + threadIdx.x; i < tw * th; i += CAMBI_TX * CAMBI_TY) {
-        int xx = x0 + i % tw, yy = y0 + i / tw;
-        uint16_t v = CAMBI_NONE;
-        if (xx >= 0 && xx < p.w && yy >= 0 && yy < p.h) {
-            size_t k = (size_t)yy * p.w + xx;
-            uint16_t s = img[k];
-            if (mask[k] && (uint16_t)(s - p.band_base) < (uint16_t)p.band_size) v = s;
-        }
-        tile[i] = v;
-    }
-    __syncthreads();
-    const int x = blockIdx.x * CAMBI_TX + threadIdx.x, y = blockIdx.y * CAMBI_TY + threadIdx.y;
-    if (x >= p.w || y >= p.h) return;
-    size_t k = (size_t)y * p.w + x;
-    const int v = img[k];
-    float c = 0.0f;
-    if (mask[k] && (unsigned)(v - p.band_base) < (unsigned)p.band_size) {
-        const unsigned lo = (unsigned)(v - CAMBI_DIFFS) & 0xFFFF;
-        unsigned long long a = 0, b = 0;  // counts of v-4 .. v and v+1 .. v+4, 12 bits each
-        const int span = 2 * p.pad + 1;
-        for (int dy = 0; dy < span; dy++) {
-            const uint16_t *row = tile + (threadIdx.y + dy) * tw + threadIdx.x;
-#pragma unroll 4
-            for (int dx = 0; dx < span; dx++) {
-                unsigned d = ((unsigned)row[dx] - lo) & 0xFFFF;
-                if (d < 5) a += 1ull << (12 * d);
-                else if (d < 9) b += 1ull << (12 * (d - 5));
-            }
-        }
-        unsigned n[9];
-        for (int i = 0; i < 5; i++) n[i] = (a >> (12 * i)) & 4095;
-        for (int i = 0; i < 4; i++) n[5 + i] = (b >> (12 * i)) & 4095;
-        const int value = v + CAMBI_DIFFS;
-        const unsigned p0 = n[CAMBI_DIFFS];
-#pragma unroll
-        for (int d = 0; d < CAMBI_DIFFS; d++) {
-            if (value <= p.tvi[d] && value + d + 1 > p.vlt) {
-                unsigned p1 = n[CAMBI_DIFFS + d + 1];
-                unsigned p2 = (v - d - 1 >= p.band_base) ? n[CAMBI_DIFFS - d - 1] : 0;
-                unsigned pm = p1 > p2 ? p1 : p2;
-                float val = (float)(p.weight[d] * p0 * pm) * reciprocal_lut[pm + p0];
-                if (val > c) c = val;
-            }
-        }
-    }
-    out[k] = c;
+    if (x < 0 || x >= p.w || y < 0 || y >= p.h) return CAMBI_NONE;
+    const size_t k = (size_t)y * p.w + x;
+    const unsigned u = (unsigned)img[k] - (unsigned)p.band_base;
+    return mask[k] && u < (unsigned)p.band_size ? (int)u : CAMBI_NONE;
 }
 
-#define ROWS_BINS 32
-#define ROWS_SPAN 24  // values of v per pass: v - 4 .. v + 4 must fit in the 32 bins
+// Where the bins of column c start; the padding puts the groups of lanes on different banks.
+__device__ __forceinline__ int cv_col(int c, int bins) { return c * bins + (c >> 4) * 8; }
 
-// The same c-values as cambi_cvalues by separable counting. For a pass over 32 consecutive values starting at `b0`,
-// each warp keeps, for every column of the tile region, the counts of those values in the vertical window around its
-// current row, then slides horizontally along the row with lane b holding the window count of value b0 + b, so each
-// pixel's nine counts are a shuffle away. Warps take every ROWS_WARPS-th row and update their column counts by the rows
-// that enter and leave. A tile needs one pass for every 24 values its pixels span.
-template <int ROWS_TX, int ROWS_TY, int ROWS_WARPS>
-__device__ void cvalues_rows(const uint16_t *img, const uint8_t *mask, const CambiParams &p, float *out)
+// The room for column counts of the tile, its margins and one column past them, in up to 32 bins. The shared memory
+// of cambi_cvalues is this, then the counts of 32 pixels (32 x 33 uint16_t), then the numbers of the values
+// (band_size + 2 * CAMBI_DIFFS uint16_t).
+__device__ __forceinline__ int cv_cols_bytes(int pad) { return (CV_TX + 2 * pad + 1) * 32 + ((CV_TX + 2 * pad + 1) >> 4) * 8 + 8; }
+
+// The passes of cambi_cvalues over a tile whose c-values need `relevant` numbered values, counted in B bins. The warp
+// works as 32 / B groups of B lanes, each group sliding along its own part of the row.
+template <int B>
+__device__ void cv_passes(const uint16_t *img, const uint8_t *mask, const CambiParams &p, float *out, uint8_t *cols,
+                          uint16_t *counts, const uint16_t *rank, int relevant, int x0, int y0, int rows)
 {
-    extern __shared__ uint16_t shared[];
-    const int span = 2 * p.pad + 1, tw = ROWS_TX + 2 * p.pad, th = ROWS_TY + 2 * p.pad;
-    uint16_t *tile = shared;
-    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-    uint8_t *cols = (uint8_t *)(tile + tw * th) + warp * tw * ROWS_BINS;
-    // per warp, the window counts of 32 consecutive pixels, one row of ROWS_BINS + 1 (padded against bank conflicts) each
-    uint16_t *counts16 = (uint16_t *)((uint8_t *)(tile + tw * th) + ROWS_WARPS * tw * ROWS_BINS) + warp * 32 * (ROWS_BINS + 1);
-    const int x0 = blockIdx.x * ROWS_TX - p.pad, y0 = blockIdx.y * ROWS_TY - p.pad;
-    for (int i = threadIdx.x; i < tw * th; i += blockDim.x) {
-        int xx = x0 + i % tw, yy = y0 + i / tw;
-        uint16_t v = CAMBI_NONE;
-        if (xx >= 0 && xx < p.w && yy >= 0 && yy < p.h) {
-            size_t k = (size_t)yy * p.w + xx;
-            uint16_t s = img[k];
-            if (mask[k] && (uint16_t)(s - p.band_base) < (uint16_t)p.band_size) v = s;
+    // groups of lanes, steps between flushes of the counts, pixels per group and row, and flushes per row
+    constexpr int G = 32 / B, K = 32 / G, PART = CV_TX / G, F = CV_TX / 32;
+    const int lane = threadIdx.x, g = lane / B, b = lane % B;
+    const int span = 2 * p.pad + 1, cw = CV_TX + 2 * p.pad;
+    // the pixels this lane computes, one per flush: K consecutive pixels of a group's part per flush
+    const int mine = (lane / K) * PART + lane % K;
+    for (int b0 = 0;;) {
+        // this pass counts values b0 .. b0 + B - 1 and serves those whose neighbours within CAMBI_DIFFS it counts
+        const int lo = b0 ? b0 + CAMBI_DIFFS : 0, hi = b0 + B >= relevant ? relevant : b0 + B - CAMBI_DIFFS;
+        auto bin = [&](int c, int y) {
+            const int u = cv_value(img, mask, p, x0 - p.pad + c, y);
+            return u == CAMBI_NONE ? (unsigned)B : (unsigned)(rank[u + CAMBI_DIFFS] - b0);
+        };
+        for (int c = lane; c < cw; c += 32) {
+            uint8_t *col = cols + cv_col(c, B);
+            for (int i = 0; i < B; i++) col[i] = 0;
+#pragma unroll 8
+            for (int dy = -p.pad; dy <= p.pad; dy++) { const unsigned k = bin(c, y0 + dy); if (k < B) col[k]++; }
         }
-        tile[i] = v;
-    }
-    __syncthreads();
-    // the range of values among this tile's own pixels that need a c-value
-    __shared__ int vmin, vmax;
-    if (threadIdx.x == 0) { vmin = 0x7FFFFFFF; vmax = -1; }
-    __syncthreads();
-    int lmin = 0x7FFFFFFF, lmax = -1;
-    for (int i = threadIdx.x; i < ROWS_TX * ROWS_TY; i += blockDim.x) {
-        int r = i / ROWS_TX, c = i % ROWS_TX;
-        uint16_t v = tile[(r + p.pad) * tw + c + p.pad];
-        if (v != CAMBI_NONE) { lmin = min(lmin, (int)v); lmax = max(lmax, (int)v); }
-    }
-    atomicMin(&vmin, lmin);
-    atomicMax(&vmax, lmax);
-    __syncthreads();
-    if (vmax < 0) return;  // the caller cleared `out`
-    for (int b0 = vmin - CAMBI_DIFFS; b0 + CAMBI_DIFFS <= vmax; b0 += ROWS_SPAN) {
-        const int first = b0 + CAMBI_DIFFS, last = b0 + CAMBI_DIFFS + ROWS_SPAN - 1;  // pixel values this pass serves
-        int prev = -1;
-        for (int r = warp; r < ROWS_TY; r += ROWS_WARPS) {
-            if (y0 + p.pad + r >= p.h) break;
-            // column counts for window rows r .. r + span - 1 of the region
-            for (int c = lane; c < tw; c += 32) {
-                uint8_t *col = cols + c * ROWS_BINS;
-                if (prev < 0) {
-                    for (int b = 0; b < ROWS_BINS; b++) col[b] = 0;
-                    for (int dy = 0; dy < span; dy++) {
-                        unsigned b = (unsigned)(tile[(r + dy) * tw + c] - b0);
-                        if (b < ROWS_BINS) col[b]++;
-                    }
-                } else {
-                    for (int rr = prev; rr < r; rr++) {
-                        unsigned out_b = (unsigned)(tile[rr * tw + c] - b0);
-                        if (out_b < ROWS_BINS) col[out_b]--;
-                        unsigned in_b = (unsigned)(tile[(rr + span) * tw + c] - b0);
-                        if (in_b < ROWS_BINS) col[in_b]++;
-                    }
-                }
-            }
-            prev = r;
-            __syncwarp();
-            const uint16_t *row = tile + (r + p.pad) * tw + p.pad;
-            // rows with no pixel to serve in this pass need only their column counts kept up to date
-            bool any = false;
-            for (int x = lane; x < ROWS_TX; x += 32) { int v = row[x]; any |= v != CAMBI_NONE && v >= first && v <= last; }
-            if (!__any_sync(0xffffffff, any)) { __syncwarp(); continue; }
-            // slide along the row: lane holds the window count of value b0 + lane. Every 32 pixels the counts go to
-            // shared memory, transposed, and each lane computes the c-value of one of those pixels.
-            unsigned n = 0;
-            for (int c = 0; c < span; c++) n += cols[c * ROWS_BINS + lane];
-            for (int xb = 0; xb < ROWS_TX; xb += 32) {
-                for (int x = xb; x < xb + 32; x++) {
-                    counts16[(x - xb) * (ROWS_BINS + 1) + lane] = (uint16_t)n;
-                    n += cols[(x + span) * ROWS_BINS + lane] - cols[x * ROWS_BINS + lane];
+        __syncwarp();
+        for (int r = 0; r < rows; r++) {
+            const int y = y0 + r;
+            if (r > 0) {
+                for (int c = lane; c < cw; c += 32) {
+                    uint8_t *col = cols + cv_col(c, B);
+                    const unsigned leave = bin(c, y - 1 - p.pad), enter = bin(c, y + p.pad);
+                    if (leave < B) col[leave]--;
+                    if (enter < B) col[enter]++;
                 }
                 __syncwarp();
-                const int x = xb + lane, v = row[x];
-                if (v != CAMBI_NONE && v >= first && v <= last && x0 + p.pad + x < p.w) {
-                    const uint16_t *cnt = counts16 + lane * (ROWS_BINS + 1) + (v - CAMBI_DIFFS - b0);
-                    const int value = v + CAMBI_DIFFS;
-                    const unsigned p0 = cnt[CAMBI_DIFFS];
+            }
+            int u[F], own[F];
+            bool any = false;
+#pragma unroll
+            for (int f = 0; f < F; f++) {
+                u[f] = cv_value(img, mask, p, x0 + mine + f * K, y);
+                own[f] = u[f] == CAMBI_NONE ? CAMBI_NONE : rank[u[f] + CAMBI_DIFFS];
+                any |= own[f] >= lo && own[f] < hi;
+            }
+            if (!__any_sync(0xffffffff, any)) continue;
+            // lane b of group g holds the window count of value b0 + b at the group's current pixel
+            const int xs = g * PART;
+            unsigned n = 0;
+            for (int c = 0; c < span; c++) n += cols[cv_col(xs + c, B) + b];
+#pragma unroll
+            for (int f = 0; f < F; f++) {
+                for (int j = 0; j < K; j++) {
+                    const int x = xs + f * K + j;
+                    counts[(g * K + j) * (B + 1) + b] = (uint16_t)n;
+                    n += cols[cv_col(x + span, B) + b] - cols[cv_col(x, B) + b];  // reads one column past the last at the end
+                }
+                __syncwarp();
+                if (own[f] >= lo && own[f] < hi) {
+                    const uint16_t *cnt = counts + lane * (B + 1) - b0;
+                    // values within CAMBI_DIFFS of this one have numbers within CAMBI_DIFFS of its own, so this pass counts them
+                    auto count = [&](int q) -> unsigned { const unsigned k = rank[q + CAMBI_DIFFS]; return k == CAMBI_NONE ? 0u : cnt[k]; };
+                    const int value = u[f] + p.band_base + CAMBI_DIFFS;
+                    const unsigned p0 = cnt[own[f]];
                     float c = 0.0f;
 #pragma unroll
                     for (int d = 0; d < CAMBI_DIFFS; d++) {
                         if (value <= p.tvi[d] && value + d + 1 > p.vlt) {
-                            unsigned p1 = cnt[CAMBI_DIFFS + d + 1];
-                            unsigned p2 = (v - d - 1 >= p.band_base) ? cnt[CAMBI_DIFFS - d - 1] : 0;
-                            unsigned pm = p1 > p2 ? p1 : p2;
-                            float val = (float)(p.weight[d] * p0 * pm) * reciprocal_lut[pm + p0];
+                            const unsigned p1 = count(u[f] + d + 1), p2 = count(u[f] - d - 1);  // 0 below the band
+                            const unsigned pm = p1 > p2 ? p1 : p2;
+                            const float val = (float)(p.weight[d] * p0 * pm) * reciprocal_lut[pm + p0];
                             if (val > c) c = val;
                         }
                     }
-                    out[(size_t)(y0 + p.pad + r) * p.w + x0 + p.pad + x] = c;
+                    out[(size_t)y * p.w + x0 + mine + f * K] = c;
                 }
                 __syncwarp();
             }
-            __syncwarp();
         }
-        __syncthreads();
+        if (hi == relevant) return;
+        b0 = hi - CAMBI_DIFFS;
+        __syncwarp();
     }
 }
 
-extern "C" __global__ void cambi_cvalues_rows(const uint16_t *img, const uint8_t *mask, CambiParams p, float *out)
+// The c-values of cambi.c's c_value_pixel for every scale, one warp per tile of CV_TX by CV_TY pixels, with `out`
+// cleared by the caller. The warp first numbers, in order, the values the tile's c-values can need: those of the masked
+// pixels in the tile and its window margins that lie within CAMBI_DIFFS of a value of the tile's own pixels, usually a
+// handful. It then counts window pixels by those numbers: for every column of the tile and its margins it keeps the
+// counts in the vertical window around the current row, updated by the rows that enter and leave as it moves down, and
+// slides a window of those along the row. With 8 or 16 numbers or fewer, groups of 8 or 16 lanes slide along different
+// parts of the row at once; with more, 32 lanes count 32 numbers per pass. A tile's warp works through its rows alone,
+// so the scales share one launch to keep the GPU busy while the small ones finish.
+extern "C" __global__ void cambi_cvalues(CambiScales sc, CambiParams p)
 {
-    cvalues_rows<128, 64, 6>(img, mask, p, out);
-}
-
-// The same for small pictures, where large tiles would leave most of the GPU idle.
-extern "C" __global__ void cambi_cvalues_rows_small(const uint16_t *img, const uint8_t *mask, CambiParams p, float *out)
-{
-    cvalues_rows<32, 32, 8>(img, mask, p, out);
+    extern __shared__ uint16_t shared16[];
+    uint8_t *shared = (uint8_t *)shared16;
+    int s = 0;
+    while ((int)blockIdx.x >= sc.first[s + 1]) s++;
+    const int tile = blockIdx.x - sc.first[s], across = (sc.w[s] + CV_TX - 1) / CV_TX;
+    p.w = sc.w[s]; p.h = sc.h[s];
+    const uint16_t *img = sc.img[s];
+    const uint8_t *mask = sc.mask[s];
+    const int lane = threadIdx.x, cw = CV_TX + 2 * p.pad, nv = p.band_size + 2 * CAMBI_DIFFS;
+    const int x0 = tile % across * CV_TX, y0 = tile / across * CV_TY, rows = min(CV_TY, p.h - y0);
+    uint8_t *cols = shared;
+    uint16_t *counts = (uint16_t *)(shared + cv_cols_bytes(p.pad)), *rank = counts + 32 * 33;  // rank by value + CAMBI_DIFFS
+    // which values occur around the tile and in it, by value + CAMBI_DIFFS, in the room of the column counts
+    uint8_t *occupied = cols, *served = cols + nv;
+    for (int i = lane; i < 2 * nv; i += 32) cols[i] = 0;
+    __syncwarp();
+    // most tiles of most pictures have no pixel in the mask and the band, and so no c-value to compute
+    bool any = false;
+#pragma unroll 4
+    for (int r = 0; r < rows; r++)
+        for (int c = lane; c < CV_TX; c += 32) {
+            const int u = cv_value(img, mask, p, x0 + c, y0 + r);
+            if (u != CAMBI_NONE) { served[u + CAMBI_DIFFS] = 1; any = true; }
+        }
+    if (!__any_sync(0xffffffff, any)) return;
+#pragma unroll 4
+    for (int r = 0; r < rows + 2 * p.pad; r++)
+        for (int c = lane; c < cw; c += 32) {
+            const int u = cv_value(img, mask, p, x0 - p.pad + c, y0 - p.pad + r);
+            if (u != CAMBI_NONE) occupied[u + CAMBI_DIFFS] = 1;
+        }
+    __syncwarp();
+    int relevant = 0;
+    for (int i0 = 0; i0 < nv; i0 += 32) {
+        const int i = i0 + lane;
+        bool need = false;
+        if (i < nv && occupied[i])
+            for (int k = -CAMBI_DIFFS; k <= CAMBI_DIFFS; k++) need |= i + k >= 0 && i + k < nv && served[i + k];
+        const unsigned m = __ballot_sync(0xffffffff, need);
+        if (i < nv) rank[i] = need ? relevant + __popc(m & ((1u << lane) - 1)) : CAMBI_NONE;
+        relevant += __popc(m);
+    }
+    __syncwarp();
+    if (relevant == 0) return;
+    float *out = sc.out[s];
+    if (relevant <= 8) cv_passes<8>(img, mask, p, out, cols, counts, rank, relevant, x0, y0, rows);
+    else if (relevant <= 16) cv_passes<16>(img, mask, p, out, cols, counts, rank, relevant, x0, y0, rows);
+    else cv_passes<32>(img, mask, p, out, cols, counts, rank, relevant, x0, y0, rows);
 }
 
 // ---- Detail, texture, grain, color and PSNR measures ----

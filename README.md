@@ -67,7 +67,7 @@ CAMBI is a port of libvmaf's `cambi.c`; it counts the same windows with a differ
 
 ## Speed
 
-On an RTX 3090 with the GPU otherwise idle, scoring a 4K HDR film against its Blu-ray remux runs at about 125 frames per second for one encode, so a 2 hour 46 minute film takes about half an hour, and two encodes in one pass run at about 55 frames per second. Scenes with much banding are slower, because CAMBI counts every banded pixel's window, and other work on the GPU slows it in proportion. The same measures as 6 second clips in the earlier Python version would have taken about 27 hours for one film.
+On an RTX 3090 with the GPU otherwise idle, scoring a 4K HDR film against its Blu-ray remux runs at about 125 frames per second for one encode, so a 2 hour 46 minute film takes about half an hour, and two encodes in one pass run at about 55 frames per second. Scenes with much banding are slower, because CAMBI counts every banded pixel's window, and other work on the GPU slows it in proportion. A run against a source scored before skips the source's CAMBI for the frames already in the cache. The same measures as 6 second clips in the earlier Python version would have taken about 27 hours for one film.
 
 ## Use case: choosing settings to re-encode a 4K film
 
