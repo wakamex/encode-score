@@ -19,7 +19,7 @@ scripts/build.sh build
 build/encode-score --help
 ```
 
-The build fetches libvmaf and the NVIDIA codec headers into the build folder the first time.
+The build fetches libvmaf and the NVIDIA codec headers into the build folder the first time, and applies `scripts/libvmaf.patch` to libvmaf. The patch makes libvmaf's motion kernel for 10-bit pictures round with an integer shift instead of a double-precision `pow()` per pixel, which takes it from 0.61 to 0.08 ms per 1080p frame on an RTX 3090 with the same results. It also clears the sums of VIF and motion on the stream that adds to them; libvmaf cleared them on another stream, so the clearing could land after some of a frame's sums were added, and VMAF varied from run to run by up to 0.4 on some frames.
 
 ## Usage
 
