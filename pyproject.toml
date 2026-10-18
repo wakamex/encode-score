@@ -1,0 +1,14 @@
+# The tests run with uv: `uv run python -m unittest discover -s tests`. The program itself is C++ and CUDA (see README).
+[project]
+name = "encode-score"
+version = "0.2.0"
+description = "Score video encodes against their source on the GPU: VMAF, banding, lasting texture and grain, every frame"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "wakamex", email = "mcosma@gmail.com" }]
+requires-python = ">=3.10"
+dependencies = ["numpy"]
+
+[tool.uv]
+package = false
