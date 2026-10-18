@@ -5,6 +5,7 @@
 // detail the encode reproduces, and the share of the source's lasting texture it reproduces (texture that stays put over
 // the 6 frames either side, so grain cannot count). The run is summarized per segment and as a whole, with a 0 to 100
 // score from four parts (see stats.hpp).
+#include "cache.hpp"
 #include "cambi.hpp"
 #include "decode.hpp"
 #include "gpu.hpp"
@@ -346,6 +347,8 @@ int main(int argc, char **argv) try {
     Buffer h3(n * 4), h9(n * 4), src_color(3 * 8);
     Buffer ring(n * 4 * kRing);  // the source's mid detail planes, by frame % kRing
     Cambi source_cambi(kernels, w, h, pd);
+    CambiCache cambi_cache(o.source, sx, sy, w, h, pd);
+    long cambi_cached = 0;
     CUevent source_ready;
     cu_check(cuEventCreate(&source_ready, CU_EVENT_DISABLE_TIMING), "creating an event");
 
@@ -411,8 +414,11 @@ int main(int argc, char **argv) try {
         prof.mark("decode");
         // queue the GPU work for this frame: the source first, then each encode, with each CAMBI on its own stream
         planes_of(sf, sx, sy, src, source_upload);
-        cu_check(cuEventRecord(source_ready, nullptr), "event");
-        source_cambi.launch(src.y16.ptr, w, source_ready);
+        const std::optional<double> cached = cambi_cache.find(sf->best_effort_timestamp);
+        if (!cached) {
+            cu_check(cuEventRecord(source_ready, nullptr), "event");
+            source_cambi.launch(src.y16.ptr, w, source_ready);
+        }
         cu_check(cuMemsetD32(src_color.ptr, 0, 6), "clearing");
         { size_t cn = n / 4; void *a[] = {&src.u.ptr, &src.v.ptr, &cn, &up10, &src_color.ptr}; sums(k.color_sums, a); }
         const int slot = (int)(frame % kRing), cslot = (int)(frame % (kRadius + 1));
@@ -460,7 +466,9 @@ int main(int argc, char **argv) try {
         prof.mark("queue");
         double scol[3];
         cu_check(cuMemcpyDtoH(scol, src_color.ptr, sizeof scol), "reading color");
-        const double source_banding = source_cambi.finish();
+        const double source_banding = cached ? *cached : source_cambi.finish();
+        if (cached) cambi_cached++;
+        else cambi_cache.add(sf->best_effort_timestamp, source_banding);
         prof.mark("gpu");
 
         // bookkeeping on the host
@@ -536,6 +544,8 @@ int main(int argc, char **argv) try {
     }
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     prof.print();
+    if (!cambi_cache.file().empty())
+        std::fprintf(stderr, "source CAMBI of %ld of %ld frames read from %s\n", cambi_cached, frame, cambi_cache.file().c_str());
 
     FILE *json = o.json.empty() ? nullptr : std::fopen(o.json.c_str(), "w");
     if (json) std::fprintf(json, "{\"source\": \"%s\", \"start\": %.6f, \"offset\": %.6f, \"frames\": %ld, \"fps\": %.6f, \"width\": %d, \"height\": %d, \"model\": \"%s\", \"segment_seconds\": %g, \"encodes\": [", o.source.c_str(), o.start, o.offset, frame, fps, w, h, model_name.c_str(), o.segment);

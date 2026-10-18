@@ -33,8 +33,18 @@ def available():
     return BINARY.exists() and shutil.which("nvidia-smi") and shutil.which("ffmpeg")
 
 
+def setUpModule():
+    # the program caches the source's CAMBI under XDG_CACHE_HOME; the tests keep theirs apart from the user's
+    global CACHE
+    CACHE = tempfile.TemporaryDirectory(prefix="encode-score-cache-")
+
+
+def tearDownModule():
+    CACHE.cleanup()
+
+
 def run(cmd):
-    return subprocess.run(cmd, capture_output=True, text=True, check=True)
+    return subprocess.run(cmd, capture_output=True, text=True, check=True, env={**os.environ, "XDG_CACHE_HOME": CACHE.name})
 
 
 @unittest.skipUnless(available(), "needs an NVIDIA GPU, ffmpeg and the built program")
@@ -128,6 +138,15 @@ class Native(unittest.TestCase):
         with self.assertRaises(subprocess.CalledProcessError) as failed:
             self.score(self.other, "--seconds", "1")
         self.assertIn("does not match the source", failed.exception.stderr)
+
+    def test_a_later_run_reads_the_source_cambi_from_the_cache(self):
+        out = Path(self.tmp.name) / "again.json"
+        result = run([str(BINARY), str(self.source), str(self.encode), "--offset", "0", "--seconds", str(SECONDS), "--json", str(out)])
+        frames = SECONDS * FPS
+        self.assertIn(f"source CAMBI of {frames} of {frames} frames read from", result.stderr)
+        again = json.loads(out.read_text())["encodes"][0]
+        self.assertEqual(again["per_frame"]["cambi_source"], self.result["encodes"][0]["per_frame"]["cambi_source"])
+        self.assertEqual(again["whole"]["cambi_source"], self.result["encodes"][0]["whole"]["cambi_source"])
 
     def test_scoring_two_encodes_in_one_pass_gives_the_same_figures_as_one_at_a_time(self):
         both = self.score(self.encode, self.encode, "--offset", "0", "--seconds", str(SECONDS))
