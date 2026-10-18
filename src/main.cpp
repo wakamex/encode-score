@@ -177,12 +177,12 @@ static Probe probe(const std::string &path, AVBufferRef *device, CUstream stream
     return {};
 }
 
-// Frames per second at which `path` decodes from `start` seconds on the GPU's decoder or the processor, measured over
-// 96 frames after the first 24 (fewer give too high a figure on the processor, whose threads have frames in hand). The
-// measurement stops early, with a lower figure, once it is known to be slower than `floor`.
+// Frames per second at which `path` decodes from `start` seconds on the GPU's decoder, measured over 24 frames after
+// the first 8, or on the processor, over 96 frames after the first 24 (fewer give too high a figure, as its threads
+// have frames in hand). The measurement stops early, with a lower figure, once it is known to be slower than `floor`.
 static double decode_rate(const std::string &path, AVBufferRef *device, bool gpu, double start, double floor)
 {
-    constexpr int kSkip = 24, kFrames = 96;
+    const int kSkip = gpu ? 8 : 24, kFrames = gpu ? 24 : 96;
     const auto t0 = std::chrono::steady_clock::now();
     auto since = [](std::chrono::steady_clock::time_point t) { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count(); };
     Decoder d(path, device, start, gpu);
