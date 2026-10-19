@@ -19,7 +19,7 @@ scripts/build.sh build
 build/encode-score --help
 ```
 
-The build fetches libvmaf and the NVIDIA codec headers into the build folder the first time, and applies `scripts/libvmaf.patch` to libvmaf. The patch makes libvmaf's motion kernel for 10-bit pictures round with an integer shift instead of a double-precision `pow()` per pixel, which takes it from 0.61 to 0.08 ms per 1080p frame on an RTX 3090 with the same results. It also clears the sums of VIF and motion on the stream that adds to them; libvmaf cleared them on another stream, so the clearing could land after some of a frame's sums were added, and VMAF varied from run to run by up to 0.4 on some frames.
+The build fetches libvmaf and the NVIDIA codec headers into the build folder the first time. libvmaf comes from [our fork](https://github.com/wakamex/vmaf), at a commit that adds two fixes to Netflix's: libvmaf's motion kernel for 10-bit pictures rounds with an integer shift instead of a double-precision `pow()` per pixel, which takes it from 0.61 to 0.08 ms per 1080p frame on an RTX 3090 with the same results, and VIF and motion clear their sums on the stream that adds to them. libvmaf cleared them on another stream, so the clearing could land after some of a frame's sums were added, and VMAF varied from run to run by up to 0.4 on some frames.
 
 ## Usage
 
@@ -160,4 +160,4 @@ The tests generate their own video with FFmpeg. They check the program frame by 
 
 ## License
 
-MIT. See [LICENSE](LICENSE). The build fetches and links [libvmaf](https://github.com/Netflix/vmaf) (BSD+Patent) and uses NVIDIA's [codec headers](https://github.com/FFmpeg/nv-codec-headers) (MIT); CAMBI's reciprocal table is copied from libvmaf at build time.
+MIT. See [LICENSE](LICENSE). The build fetches and links [libvmaf](https://github.com/Netflix/vmaf) (BSD+Patent), from our fork, and uses NVIDIA's [codec headers](https://github.com/FFmpeg/nv-codec-headers) (MIT); CAMBI's reciprocal table is copied from libvmaf at build time.
