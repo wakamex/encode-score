@@ -71,6 +71,38 @@ name=encode-score-v$VERSION-x86_64-linux
 rm -rf "/b/$name" && mkdir -p "/b/$name/licenses"
 cp /b/encode-score /n/README.md /n/LICENSE "/b/$name/"
 cp /b/vmaf/LICENSE "/b/$name/licenses/libvmaf-LICENSE"
+# the notices of the third-party code compiled into libvmaf.a, from the headers of its sources
+v=/b/vmaf/libvmaf/src
+{
+    echo "libvmaf compiles in the following third-party code, under these notices."
+    for f in svm.h x86/cpu.c feature/iqa/convolve.c feature/iqa/decimate.c feature/iqa/math_utils.c \
+             feature/iqa/ssim_tools.c feature/third_party/xiph/psnr_hvs.c; do
+        printf '\n==== libvmaf/src/%s\n\n' "$f"
+        sed -n '1,/\*\//p' "$v/$f"
+    done
+    printf '\n==== libvmaf/src/x86/cpuid.asm\n\n'
+    sed -n '1,/^$/p' "$v/x86/cpuid.asm"
+    # also assembled into FFmpeg and dav1d, in their own copies
+    printf '\n==== libvmaf/src/ext/x86/x86inc.asm\n\n'
+    awk '{print} /^;[*][*][*][*][*][*][*][*][*][*]/ && ++n == 3 {exit}' "$v/ext/x86/x86inc.asm"
+    printf '\n==== libvmaf/src/feature/mkdirp.c\n\n'
+    sed -n '/Copyright/,/MIT licensed/p' "$v/feature/mkdirp.c"
+    cat <<'MIT'
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the Software without restriction, including without limitation the
+rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit
+persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the
+Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
+WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+MIT
+} > "/b/$name/licenses/libvmaf-third-party.txt"
 cp "/b/deps/ffmpeg-$FFMPEG_VERSION/COPYING.LGPLv2.1" "/b/$name/licenses/FFmpeg-COPYING.LGPLv2.1"
 cp "/b/deps/dav1d-$DAV1D_VERSION/COPYING" "/b/$name/licenses/dav1d-COPYING"
 sed -n '1,/\*\//p' /b/nvh/include/ffnvcodec/dynlink_loader.h > "/b/$name/licenses/nv-codec-headers-LICENSE"
