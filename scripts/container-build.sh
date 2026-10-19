@@ -2,6 +2,14 @@
 # Runs inside the CUDA 13.1 container (see build-gpu.sh): builds libvmaf with its CUDA backend as a static library, and
 # the kernels as a fatbin, into /b.
 set -euo pipefail
+# packages come from Ubuntu's snapshot of one moment, so every build installs the same versions; the image's NVIDIA
+# repository is not needed
+. /etc/os-release
+rm -f /etc/apt/sources.list.d/cuda*.list /etc/apt/sources.list.d/ubuntu.sources
+APT_SNAPSHOT=https://snapshot.ubuntu.com/ubuntu/20261018T000000Z
+for suite in "$VERSION_CODENAME" "$VERSION_CODENAME-updates" "$VERSION_CODENAME-security"; do
+    echo "deb $APT_SNAPSHOT $suite main universe"
+done > /etc/apt/sources.list
 apt-get update -qq >/dev/null && apt-get install -y -qq meson ninja-build nasm pkg-config git xxd >/dev/null 2>&1
 # the libvmaf and NVIDIA codec header commits the program was tested with. libvmaf comes from our fork, whose commit
 # adds two fixes to Netflix's 229f2478: libvmaf's motion kernel for 10-bit pictures rounds with an integer shift

@@ -66,7 +66,10 @@ LD_LIBRARY_PATH=/b/stub /b/encode-score --version | grep -qx "encode-score $VERS
 LD_LIBRARY_PATH=/b/stub /b/encode-score --help | grep -q -- --offset
 echo "built encode-score $VERSION, loading $needed"
 
-# the release assets
+# the release assets, packed the same on every build: in name order, owned by root, dated at the commit, and compressed
+# without a timestamp
+epoch=$(git -c safe.directory=/n -C /n log -1 --format=%ct)
+pack() { tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$epoch" -cf - -C /b "$2" | gzip -9n > "$1"; }
 name=encode-score-v$VERSION-x86_64-linux
 rm -rf "/b/$name" && mkdir -p "/b/$name/licenses"
 cp /b/encode-score /n/README.md /n/LICENSE "/b/$name/"
@@ -106,7 +109,7 @@ MIT
 cp "/b/deps/ffmpeg-$FFMPEG_VERSION/COPYING.LGPLv2.1" "/b/$name/licenses/FFmpeg-COPYING.LGPLv2.1"
 cp "/b/deps/dav1d-$DAV1D_VERSION/COPYING" "/b/$name/licenses/dav1d-COPYING"
 sed -n '1,/\*\//p' /b/nvh/include/ffnvcodec/dynlink_loader.h > "/b/$name/licenses/nv-codec-headers-LICENSE"
-mkdir -p /out && tar -czf "/out/$name.tar.gz" -C /b "$name"
+mkdir -p /out && pack "/out/$name.tar.gz" "$name"
 src=encode-score-v$VERSION-ffmpeg-source
 rm -rf "/b/$src" && mkdir -p "/b/$src/scripts"
 cp "/b/sources/ffmpeg-$FFMPEG_VERSION.tar.xz" "/b/$src/"
@@ -116,11 +119,11 @@ encode-score $VERSION links FFmpeg $FFMPEG_VERSION's libavformat, libavcodec and
 Lesser General Public License version 2.1 or later (COPYING.LGPLv2.1 in the tarball).
 
 ffmpeg-$FFMPEG_VERSION.tar.xz is FFmpeg's unmodified release tarball. scripts/build-linux.sh configures and builds it
-(see its ./configure line) and links encode-score against it, inside docker.io/nvidia/cuda:13.1.1-devel-ubuntu22.04;
+(see its ./configure line) and links encode-score against it, inside the container image release/stage.sh names;
 scripts/container-build.sh, which it runs first, builds libvmaf and encode-score's GPU kernels.
 
 To relink encode-score with a modified FFmpeg, check out https://github.com/wakamex/encode-score at v$VERSION, change
 the FFmpeg tarball and checksum at the top of release/build-linux.sh to your own, and run release/stage.sh.
 TXT
-tar -czf "/out/$src.tar.gz" -C /b "$src"
+pack "/out/$src.tar.gz" "$src"
 echo "packed $name.tar.gz and $src.tar.gz"
