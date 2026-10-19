@@ -1,0 +1,41 @@
+name: validation
+
+on:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build the release assets and run the tests a runner can
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out the exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      # the frame-by-frame tests against libvmaf need an NVIDIA GPU, which runners lack, and skip themselves; the numpy
+      # reference implementation's tests run
+      - name: Run the tests
+        run: UV_PYTHON=$(cat .python-version) uv --no-config run --locked python -m unittest discover -s tests -v
+      # the build starts the program for --version and --help, with the CUDA toolkit's stub in place of the driver
+      - name: Build the release assets
+        run: release/stage.sh dist
+
+  validate:
+    name: validate
+    if: always()
+    needs:
+      - build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require the build and tests to have passed
+        uses: wakamex/release-actions/validate-gate@stable
+        with:
+          needs: ${{ toJSON(needs) }}

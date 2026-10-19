@@ -4,13 +4,29 @@ encode-score compares video encodes with their source and says what a viewer wou
 
 VMAF alone is a poor judge of small encodes of grainy or dark material. It scores brightness only, it rates a soft, grain-free picture as nearly perfect, and it does not see banding. In the film trial below, a 9.3 GB public encode and our own encode scored within 0.1 VMAF of each other on the hardest scene, while one of them banded visibly and had lost three quarters of the film's grain.
 
-## Requirements and building
+## Installing
 
 encode-score runs on an NVIDIA GPU (Turing or newer) and Linux. It decodes each file with the GPU's video decoder or on the processor, whichever makes the run faster (see Speed), computes VMAF with libvmaf's CUDA backend, and runs its own measures as CUDA kernels.
 
+Each [release](https://github.com/wakamex/encode-score/releases) has a Linux x86-64 build, `encode-score-vX.Y.Z-x86_64-linux.tar.gz`, which needs glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36 or later) and an NVIDIA driver for CUDA 13, release 580 or newer; it was tested with 615. [FFmpeg](https://ffmpeg.org/) and libvmaf are built into it, so nothing else needs installing:
+
+```
+tar -xzf encode-score-vX.Y.Z-x86_64-linux.tar.gz
+encode-score-vX.Y.Z-x86_64-linux/encode-score --help
+```
+
+The archive's `licenses/` folder holds the license texts of what is built in. FFmpeg is linked statically under the GNU Lesser General Public License (LGPL), so each release also has `encode-score-vX.Y.Z-ffmpeg-source.tar.gz`, FFmpeg's release tarball with the scripts that build it and link it in. Check a downloaded archive with:
+
+```
+gh attestation verify ASSET --repo wakamex/encode-score --signer-workflow wakamex/release-actions/.github/workflows/binary-release.yml
+gh release verify-asset vX.Y.Z ASSET --repo wakamex/encode-score
+```
+
+## Building
+
 Building needs:
 
-- the [FFmpeg](https://ffmpeg.org/) development libraries (libavformat, libavcodec, libavutil; developed against FFmpeg 8.1) and a C++ compiler with C++26 `#embed` support, such as GCC 15 or newer;
+- the FFmpeg development libraries (libavformat, libavcodec, libavutil; developed against FFmpeg 8.1 and released with 9.0) and a C++20 compiler;
 - the CUDA driver API headers, from the [CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit) 13;
 - [Podman](https://podman.io/) and the `nvidia/cuda:13.1.1-devel-ubuntu24.04` image, in which the GPU code (libvmaf with CUDA, and the kernels) is compiled, because CUDA 13.1 does not accept the newer host compilers and C library of current Linux distributions.
 
@@ -151,7 +167,7 @@ Two parts of the score mean something slightly different for game footage. The g
 ## Development
 
 ```
-uv run python -m unittest discover -s tests
+uv run --locked python -m unittest discover -s tests
 ```
 
 The tests generate their own video with FFmpeg. They check the program frame by frame against FFmpeg's libvmaf filter for VMAF, CAMBI and PSNR at 8 and 10 bits; check the detail, texture, grain and color figures against the numpy implementation in `reference/`; check that the offset of an encode starting a second later is found to the frame and that a different picture is refused; and check that a source decoded on the processor scores exactly as when decoded on the GPU, and that two encodes in one pass score as they do alone. They keep their CAMBI cache in a temporary folder and check that a second run reads the source's CAMBI from it unchanged. The tests of the program are skipped without an NVIDIA GPU and the built program (`build/encode-score`, or the path in `ENCODE_SCORE_BIN`).
@@ -160,4 +176,4 @@ The tests generate their own video with FFmpeg. They check the program frame by 
 
 ## License
 
-MIT. See [LICENSE](LICENSE). The build fetches and links [libvmaf](https://github.com/Netflix/vmaf) (BSD+Patent), from our fork, and uses NVIDIA's [codec headers](https://github.com/FFmpeg/nv-codec-headers) (MIT); CAMBI's reciprocal table is copied from libvmaf at build time.
+encode-score is MIT; see [LICENSE](LICENSE). The build fetches and links [libvmaf](https://github.com/Netflix/vmaf) (BSD+Patent), from our fork, and uses NVIDIA's [codec headers](https://github.com/FFmpeg/nv-codec-headers) (MIT); CAMBI's reciprocal table is copied from libvmaf at build time. The release builds also link FFmpeg (LGPL 2.1 or later, built without its GPL and nonfree parts) and [dav1d](https://code.videolan.org/videolan/dav1d) (BSD-2-Clause) statically, and carry each of these licenses in their `licenses/` folder.
