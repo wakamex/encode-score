@@ -1,10 +1,9 @@
 #include "gpu.hpp"
 
-static const unsigned char kFatbin[] = {
-#embed "kernels.fatbin"
-};
+// the kernels, compiled by the build into a C array (xxd -i kernels.fatbin)
+#include "kernels_fatbin.h"
 
-void Kernels::load() { cu_check(cuModuleLoadData(&module_, kFatbin), "loading kernels"); }
+void Kernels::load() { cu_check(cuModuleLoadData(&module_, kernels_fatbin), "loading kernels"); }
 
 CUfunction Kernels::get(const char *name) const
 {

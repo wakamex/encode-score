@@ -1,7 +1,8 @@
-# The tests run with uv: `uv run python -m unittest discover -s tests`. The program itself is C++ and CUDA (see README).
+# The tests run with uv: `uv run python -m unittest discover -s tests`. The program itself is C++ and CUDA (see README);
+# `version` is its version, which the build compiles in and release tags match.
 [project]
 name = "encode-score"
-version = "0.2.0"
+version = "0.1.0"
 description = "Score video encodes against their source on the GPU: VMAF, banding, lasting texture and grain, every frame"
 readme = "README.md"
 license = "MIT"

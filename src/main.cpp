@@ -38,7 +38,8 @@ static const char *kUsage =
     "  --seconds N        how much to score (default: to the end of the shortest file)\n"
     "  --segment SECONDS  length of the summary segments (default 60)\n"
     "  --model NAME       VMAF model (default: vmaf_4k_v0.6.1 for 4K pictures, vmaf_v0.6.1 below)\n"
-    "  --json FILE        write every per-frame and per-segment figure\n";
+    "  --json FILE        write every per-frame and per-segment figure\n"
+    "  --version          print the version\n";
 
 struct Options {
     std::string source, json, model = "auto";
@@ -65,6 +66,7 @@ static Options parse(int argc, char **argv)
         else if (a == "--json") o.json = value();
         else if (a == "--model") o.model = value();
         else if (a == "-h" || a == "--help") { std::fputs(kUsage, stdout); std::exit(0); }
+        else if (a == "--version") { std::printf("encode-score %s\n", ENCODE_SCORE_VERSION); std::exit(0); }
         else if (a.rfind("--", 0) == 0) throw std::runtime_error("unknown option " + a + "\n" + kUsage);
         else positional.push_back(a);
     }

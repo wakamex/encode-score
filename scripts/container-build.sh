@@ -26,4 +26,5 @@ awk '/static const float reciprocal_lut\[CAMBI_RECIPROCAL_LUT_SIZE\]/{on=1; sub(
 ARCHS=""
 for a in 75 80 86 89 90 100 120; do ARCHS="$ARCHS -gencode arch=compute_$a,code=sm_$a"; done
 nvcc -I/b -fatbin -O3 -std=c++17 $ARCHS -gencode arch=compute_75,code=compute_75 /n/src/kernels.cu -o /b/kernels.fatbin
+(cd /b && xxd -i kernels.fatbin > kernels_fatbin.h)
 echo gpu parts built
